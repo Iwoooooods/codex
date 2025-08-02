@@ -53,6 +53,7 @@ use crate::models::FunctionCallOutputPayload;
 use crate::models::LocalShellAction;
 use crate::models::ReadFileToolCallParams;
 use crate::models::ReasoningItemReasoningSummary;
+use crate::models::RegexSearchToolCallParams;
 use crate::models::ResponseInputItem;
 use crate::models::ResponseItem;
 use crate::models::ShellToolCallParams;
@@ -1287,6 +1288,7 @@ async fn handle_response_item(
                 command: action.command,
                 workdir: action.working_directory,
                 timeout: action.timeout_ms,
+                explanation: None,
             };
             let effective_call_id = match (call_id, id) {
                 (Some(call_id), _) => call_id,
@@ -1342,6 +1344,16 @@ async fn handle_function_call(
         }
         "read_file" => {
             let params = match parse_read_file_arguments(arguments, &call_id) {
+                Ok(params) => params,
+                Err(output) => {
+                    return *output;
+                }
+            };
+            let exec_params = params.to_exec_params(sess);
+            handle_container_exec_with_params(exec_params, sess, sub_id, call_id).await
+        }
+        "regex_search" => {
+            let params = match parse_regex_search_arguments(arguments, &call_id) {
                 Ok(params) => params,
                 Err(output) => {
                     return *output;
@@ -1424,7 +1436,46 @@ fn parse_read_file_arguments(
                     let output = ResponseInputItem::FunctionCallOutput {
                         call_id: call_id.to_string(),
                         output: FunctionCallOutputPayload {
-                            content: format!("validation error: {}", validation_error),
+                            content: format!("validation error: {validation_error}"),
+                            success: None,
+                        },
+                    };
+                    Err(Box::new(output))
+                }
+            }
+        }
+        Err(e) => {
+            // allow model to re-sample
+            let output = ResponseInputItem::FunctionCallOutput {
+                call_id: call_id.to_string(),
+                output: FunctionCallOutputPayload {
+                    content: format!("failed to parse function arguments: {e}"),
+                    success: None,
+                },
+            };
+            Err(Box::new(output))
+        }
+    }
+}
+
+// parse_regex_search_arguments parses json parameters from assistant message
+// we will parse RegexSearchToolCallParams to ExecParams to reuse command execution logic
+fn parse_regex_search_arguments(
+    arguments: String, // json string parameters from assistant message
+    call_id: &str,
+) -> Result<RegexSearchToolCallParams, Box<ResponseInputItem>> {
+    // parse regex_search parameters
+    match serde_json::from_str::<RegexSearchToolCallParams>(&arguments) {
+        Ok(regex_search_params) => {
+            // Validate the parameters
+            match regex_search_params.validate() {
+                Ok(()) => Ok(regex_search_params),
+                Err(validation_error) => {
+                    // Return validation error to allow model to re-sample
+                    let output = ResponseInputItem::FunctionCallOutput {
+                        call_id: call_id.to_string(),
+                        output: FunctionCallOutputPayload {
+                            content: format!("validation error: {validation_error}"),
                             success: None,
                         },
                     };

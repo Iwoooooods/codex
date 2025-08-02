@@ -9,6 +9,7 @@ use crate::models::FunctionCallOutputPayload;
 use crate::models::ResponseInputItem;
 use crate::openai_tools::JsonSchema;
 use crate::openai_tools::OpenAiTool;
+use crate::openai_tools::Property;
 use crate::openai_tools::ResponsesApiTool;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
@@ -39,8 +40,22 @@ pub struct UpdatePlanArgs {
 
 pub(crate) static PLAN_TOOL: LazyLock<OpenAiTool> = LazyLock::new(|| {
     let mut plan_item_props = BTreeMap::new();
-    plan_item_props.insert("step".to_string(), JsonSchema::String);
-    plan_item_props.insert("status".to_string(), JsonSchema::String);
+    plan_item_props.insert(
+        "step".to_string(),
+        Property::WithDescription {
+            schema: JsonSchema::String,
+            description: Some("A short, 1-sentence description of the step"),
+            enum_values: None,
+        },
+    );
+    plan_item_props.insert(
+        "status".to_string(),
+        Property::WithDescription {
+            schema: JsonSchema::String,
+            description: Some("The current status of this step"),
+            enum_values: Some(&["pending", "in_progress", "completed"]),
+        },
+    );
 
     let plan_items_schema = JsonSchema::Array {
         items: Box::new(JsonSchema::Object {
@@ -51,8 +66,15 @@ pub(crate) static PLAN_TOOL: LazyLock<OpenAiTool> = LazyLock::new(|| {
     };
 
     let mut properties = BTreeMap::new();
-    properties.insert("explanation".to_string(), JsonSchema::String);
-    properties.insert("plan".to_string(), plan_items_schema);
+    properties.insert(
+        "explanation".to_string(),
+        Property::WithDescription {
+            schema: JsonSchema::String,
+            description: Some("Optional explanation for plan updates or changes"),
+            enum_values: None,
+        },
+    );
+    properties.insert("plan".to_string(), Property::Simple(plan_items_schema));
 
     OpenAiTool::Function(ResponsesApiTool {
         name: "update_plan",

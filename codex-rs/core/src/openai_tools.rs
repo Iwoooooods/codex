@@ -1,4 +1,3 @@
-use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -7,6 +6,7 @@ use tracing::debug;
 
 use crate::client_common::Prompt;
 use crate::models::ReadFileToolCallParams;
+use crate::models::RegexSearchToolCallParams;
 use crate::models::ShellToolCallParams;
 use crate::plan_tool::PLAN_TOOL;
 
@@ -45,11 +45,27 @@ pub(crate) enum JsonSchema {
         items: Box<JsonSchema>,
     },
     Object {
-        properties: BTreeMap<String, JsonSchema>,
+        properties: BTreeMap<String, Property>,
         required: &'static [&'static str],
         #[serde(rename = "additionalProperties")]
         additional_properties: bool,
     },
+}
+
+/// A property in a JSON schema that can include a description
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub(crate) enum Property {
+    WithDescription {
+        #[serde(flatten)]
+        schema: JsonSchema,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "enum")]
+        enum_values: Option<&'static [&'static str]>,
+    },
+    Simple(JsonSchema),
 }
 
 /// Helper function to create an OpenAI tool from a struct that implements ToJsonSchema
@@ -60,7 +76,7 @@ where
     OpenAiTool::Function(ResponsesApiTool {
         name,
         description,
-        strict: false,
+        strict: true,
         parameters: T::to_json_schema(),
     })
 }
@@ -75,6 +91,10 @@ static DEFAULT_TOOLS: LazyLock<Vec<OpenAiTool>> = LazyLock::new(|| {
         create_tool_from_struct::<ReadFileToolCallParams>(
             "read_file",
             "Read the contents of a file at the specified path.",
+        ),
+        create_tool_from_struct::<RegexSearchToolCallParams>(
+            "regex_search",
+            "Searches for regex patterns in files using ripgrep. Returns up to 50 matches with support for case sensitivity, file inclusion/exclusion patterns.",
         ),
     ]
 });

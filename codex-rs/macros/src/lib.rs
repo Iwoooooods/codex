@@ -8,11 +8,15 @@ use syn::parse_macro_input;
 /// This macro generates an implementation of the `ToJsonSchema` trait that returns
 /// the corresponding JSON schema for OpenAI tool calls.
 ///
+/// Field descriptions can be provided using doc comments:
+///
 /// # Example
 /// ```rust
 /// #[derive(ToolSchema)]
 /// struct WeatherParams {
+///     /// The city and country, e.g. "Bogotá, Colombia"
 ///     city: String,
+///     /// Optional temperature reading
 ///     temperature: Option<i32>,
 /// }
 /// ```
@@ -28,6 +32,7 @@ pub fn derive_tool_schema(input: TokenStream) -> TokenStream {
         impl ToJsonSchema for #name {
             fn to_json_schema() -> JsonSchema {
                 use std::collections::BTreeMap;
+                use crate::openai_tools::Property;
                 #schema
             }
         }
@@ -46,12 +51,15 @@ fn generate_schema_from_struct(input: &DeriveInput) -> proc_macro2::TokenStream 
                 let field_name = ident;
                 let field_type = &field.ty;
 
+                // Extract description from doc comments
+                let description = extract_doc_comment(&field.attrs);
+
                 // Map Rust types to JSON schema types
-                let schema_type = map_rust_type_to_schema(field_type);
+                let property = map_rust_type_to_property(field_type, description.as_deref());
 
                 let field_name_str = field_name.to_string();
                 properties.push(quote! {
-                    properties.insert(#field_name_str.to_string(), #schema_type);
+                    properties.insert(#field_name_str.to_string(), #property);
                 });
 
                 // Check if field is optional (Option<T>)
@@ -79,6 +87,40 @@ fn generate_schema_from_struct(input: &DeriveInput) -> proc_macro2::TokenStream 
     }
 }
 
+/// Extract documentation comment from field attributes
+fn extract_doc_comment(attrs: &[syn::Attribute]) -> Option<String> {
+    let mut doc_parts = Vec::new();
+
+    for attr in attrs {
+        if attr.path().is_ident("doc") {
+            if let syn::Meta::NameValue(meta) = &attr.meta {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(lit_str),
+                    ..
+                }) = &meta.value
+                {
+                    let comment = lit_str.value();
+                    // Remove leading/trailing whitespace and common doc comment prefixes
+                    let trimmed = comment
+                        .trim()
+                        .trim_start_matches("//")
+                        .trim_start_matches("///")
+                        .trim();
+                    if !trimmed.is_empty() {
+                        doc_parts.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if doc_parts.is_empty() {
+        None
+    } else {
+        Some(doc_parts.join(" "))
+    }
+}
+
 fn is_option_type(ty: &syn::Type) -> bool {
     if let syn::Type::Path(type_path) = ty {
         let path = &type_path.path;
@@ -89,7 +131,14 @@ fn is_option_type(ty: &syn::Type) -> bool {
     false
 }
 
-fn map_rust_type_to_schema(ty: &syn::Type) -> proc_macro2::TokenStream {
+fn map_rust_type_to_property(
+    ty: &syn::Type,
+    description: Option<&str>,
+) -> proc_macro2::TokenStream {
+    let desc = description
+        .map(|d| quote! { Some(#d) })
+        .unwrap_or_else(|| quote! { None });
+
     match ty {
         syn::Type::Path(type_path) => {
             let path = &type_path.path;
@@ -97,14 +146,42 @@ fn map_rust_type_to_schema(ty: &syn::Type) -> proc_macro2::TokenStream {
 
             if segments.len() == 1 {
                 match segments[0].to_string().as_str() {
-                    "String" => quote! { JsonSchema::String },
-                    "str" => quote! { JsonSchema::String },
-                    "i32" | "i64" | "u32" | "u64" | "f32" | "f64" => quote! { JsonSchema::Number },
-                    "bool" => quote! { JsonSchema::Boolean },
+                    "String" => quote! {
+                        Property::WithDescription {
+                            schema: JsonSchema::String,
+                            description: #desc,
+                            enum_values: None,
+                        }
+                    },
+                    "str" => quote! {
+                        Property::WithDescription {
+                            schema: JsonSchema::String,
+                            description: #desc,
+                            enum_values: None,
+                        }
+                    },
+                    "i32" | "i64" | "u32" | "u64" | "f32" | "f64" => quote! {
+                        Property::WithDescription {
+                            schema: JsonSchema::Number,
+                            description: #desc,
+                            enum_values: None,
+                        }
+                    },
+                    "bool" => quote! {
+                        Property::WithDescription {
+                            schema: JsonSchema::Boolean,
+                            description: #desc,
+                            enum_values: None,
+                        }
+                    },
                     "Vec" => {
                         quote! {
-                            JsonSchema::Array {
-                                items: Box::new(JsonSchema::String),
+                            Property::WithDescription {
+                                schema: JsonSchema::Array {
+                                    items: Box::new(JsonSchema::String),
+                                },
+                                description: #desc,
+                                enum_values: None,
                             }
                         }
                     }
@@ -115,26 +192,60 @@ fn map_rust_type_to_schema(ty: &syn::Type) -> proc_macro2::TokenStream {
                                 if let Some(syn::GenericArgument::Type(inner_type)) =
                                     args.args.first()
                                 {
-                                    return map_rust_type_to_schema(inner_type);
+                                    return map_rust_type_to_property(inner_type, description);
                                 }
                             }
                         }
                         // Fallback if we can't extract inner type
-                        quote! { JsonSchema::String }
+                        quote! {
+                            Property::WithDescription {
+                                schema: JsonSchema::String,
+                                description: #desc,
+                                enum_values: None,
+                            }
+                        }
                     }
-                    _ => quote! { JsonSchema::String }, // Default to string
+                    _ => quote! {
+                        Property::WithDescription {
+                            schema: JsonSchema::String,
+                            description: #desc,
+                            enum_values: None,
+                        }
+                    }, // Default to string
                 }
             } else if segments.len() == 2 && segments[0].to_string() == "Vec" {
                 quote! {
-                    JsonSchema::Array {
-                        items: Box::new(JsonSchema::String),
+                    Property::WithDescription {
+                        schema: JsonSchema::Array {
+                            items: Box::new(JsonSchema::String),
+                        },
+                        description: #desc,
+                        enum_values: None,
                     }
                 }
             } else {
-                quote! { JsonSchema::String } // Default fallback
+                quote! {
+                    Property::WithDescription {
+                        schema: JsonSchema::String,
+                        description: #desc,
+                        enum_values: None,
+                    }
+                } // Default fallback
             }
         }
-        syn::Type::Reference(_) => quote! { JsonSchema::String }, // &str, &String, etc.
-        _ => quote! { JsonSchema::String },                       // Default fallback
+        syn::Type::Reference(_) => quote! {
+            Property::WithDescription {
+                schema: JsonSchema::String,
+                description: #desc,
+                enum_values: None,
+            }
+        }, // &str, &String, etc.
+        _ => quote! {
+            Property::WithDescription {
+                schema: JsonSchema::String,
+                description: #desc,
+                enum_values: None,
+            }
+        }, // Default fallback
     }
 }

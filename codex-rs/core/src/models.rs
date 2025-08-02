@@ -180,12 +180,15 @@ impl From<Vec<InputItem>> for ResponseInputItem {
 /// or shell`, the `arguments` field should deserialize to this struct.
 #[derive(macros::ToolSchema, Deserialize, Debug, Clone, PartialEq)]
 pub struct ShellToolCallParams {
+    /// The shell command to execute as an array of arguments
     pub command: Vec<String>,
+    /// Optional working directory for the command execution
     pub workdir: Option<String>,
 
     /// This is the maximum time in milliseconds that the command is allowed to run.
-    #[serde(rename = "timeout")]
     pub timeout: Option<u64>,
+    /// Optional explanation of what the command is intended to do
+    pub explanation: Option<String>,
 }
 
 impl ShellToolCallParams {
@@ -201,10 +204,15 @@ impl ShellToolCallParams {
 
 #[derive(macros::ToolSchema, Deserialize, Debug, Clone, PartialEq)]
 pub struct ReadFileToolCallParams {
+    /// The path of the file to read
     pub path: String,
+    /// Whether to read the entire file or just specific lines
     pub should_read_entire_file: bool,
+    /// The one-indexed line number to start reading from (required if should_read_entire_file is false)
     pub start_line_one_indexed: Option<u64>,
+    /// The one-indexed line number to end reading at, inclusive (required if should_read_entire_file is false)
     pub end_line_one_indexed_inclusive: Option<u64>,
+    /// Optional explanation of why this file is being read
     pub explanation: Option<String>,
 }
 
@@ -269,6 +277,80 @@ impl ReadFileToolCallParams {
         // Validate path is not empty
         if self.path.trim().is_empty() {
             return Err("path cannot be empty".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(macros::ToolSchema, Deserialize, Debug, Clone, PartialEq)]
+pub struct RegexSearchToolCallParams {
+    /// The regex pattern to search for in files
+    pub query: String,
+    /// Whether the search should be case sensitive (defaults to true if not specified)
+    pub case_sensitive: Option<bool>,
+    /// Optional glob pattern for files to include in the search (e.g., "*.rs")
+    pub include_pattern: Option<String>,
+    /// Optional glob pattern for files to exclude from the search
+    pub exclude_pattern: Option<String>,
+    /// Optional explanation of what is being searched for and why
+    pub explanation: Option<String>,
+}
+
+impl RegexSearchToolCallParams {
+    pub(crate) fn to_exec_params(&self, sess: &Session) -> ExecParams {
+        let mut command = vec!["rg".to_string()];
+
+        // Add max count limit to avoid overwhelming output
+        command.extend_from_slice(&["--max-count".to_string(), "50".to_string()]);
+
+        // Add case sensitivity option (ripgrep is case-sensitive by default)
+        if let Some(case_sensitive) = self.case_sensitive {
+            if !case_sensitive {
+                command.push("--ignore-case".to_string());
+            }
+        }
+
+        // Add include pattern if specified
+        if let Some(include_pattern) = &self.include_pattern {
+            command.extend_from_slice(&["--glob".to_string(), include_pattern.clone()]);
+        }
+
+        // Add exclude pattern if specified
+        if let Some(exclude_pattern) = &self.exclude_pattern {
+            command.extend_from_slice(&["--glob".to_string(), format!("!{}", exclude_pattern)]);
+        }
+
+        // Add the query as the last argument
+        command.push(self.query.clone());
+
+        ExecParams {
+            command,
+            cwd: sess.resolve_path(None), // Search in current working directory
+            timeout_ms: Some(30000),      // 30 second timeout for searches
+            env: create_env(&sess.shell_environment_policy),
+        }
+    }
+
+    /// Validates the parameters to ensure they are valid for regex search
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate query is not empty
+        if self.query.trim().is_empty() {
+            return Err("query cannot be empty".to_string());
+        }
+
+        // Basic validation for include pattern
+        if let Some(include_pattern) = &self.include_pattern {
+            if include_pattern.trim().is_empty() {
+                return Err("include_pattern cannot be empty when specified".to_string());
+            }
+        }
+
+        // Basic validation for exclude pattern
+        if let Some(exclude_pattern) = &self.exclude_pattern {
+            if exclude_pattern.trim().is_empty() {
+                return Err("exclude_pattern cannot be empty when specified".to_string());
+            }
         }
 
         Ok(())
@@ -386,6 +468,7 @@ mod tests {
                 command: vec!["ls".to_string(), "-l".to_string()],
                 workdir: Some("/tmp".to_string()),
                 timeout: Some(1000),
+                explanation: None,
             },
             params
         );
