@@ -683,6 +683,7 @@ dependencies = [
  "futures",
  "landlock",
  "libc",
+ "macros",
  "maplit",
  "mcp-types",
  "mime_guess",
@@ -2599,6 +2600,15 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "url",
+]
+
+[[package]]
+name = "macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.104",
 ]
 
 [[package]]

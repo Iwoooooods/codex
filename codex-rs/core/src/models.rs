@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::exec_env::create_env;
 use base64::Engine;
 use mcp_types::CallToolResult;
 use serde::Deserialize;
@@ -7,6 +8,10 @@ use serde::Deserializer;
 use serde::Serialize;
 use serde::ser::Serializer;
 
+use crate::codex::Session;
+use crate::exec::ExecParams;
+use crate::openai_tools::JsonSchema;
+use crate::openai_tools::ToJsonSchema;
 use crate::protocol::InputItem;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,16 +178,101 @@ impl From<Vec<InputItem>> for ResponseInputItem {
 
 /// If the `name` of a `ResponseItem::FunctionCall` is either `container.exec`
 /// or shell`, the `arguments` field should deserialize to this struct.
-#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[derive(macros::ToolSchema, Deserialize, Debug, Clone, PartialEq)]
 pub struct ShellToolCallParams {
     pub command: Vec<String>,
     pub workdir: Option<String>,
 
-    /// This is the maximum time in seconds that the command is allowed to run.
+    /// This is the maximum time in milliseconds that the command is allowed to run.
     #[serde(rename = "timeout")]
-    // The wire format uses `timeout`, which has ambiguous units, so we use
-    // `timeout_ms` as the field name so it is clear in code.
-    pub timeout_ms: Option<u64>,
+    pub timeout: Option<u64>,
+}
+
+impl ShellToolCallParams {
+    pub(crate) fn to_exec_params(&self, sess: &Session) -> ExecParams {
+        ExecParams {
+            command: self.command.clone(),
+            cwd: sess.resolve_path(self.workdir.clone()),
+            timeout_ms: self.timeout,
+            env: create_env(&sess.shell_environment_policy),
+        }
+    }
+}
+
+#[derive(macros::ToolSchema, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReadFileToolCallParams {
+    pub path: String,
+    pub should_read_entire_file: bool,
+    pub start_line_one_indexed: Option<u64>,
+    pub end_line_one_indexed_inclusive: Option<u64>,
+    pub explanation: Option<String>,
+}
+
+impl ReadFileToolCallParams {
+    pub(crate) fn to_exec_params(&self, sess: &Session) -> ExecParams {
+        let command = if self.should_read_entire_file {
+            // use `cat` to read the entire file
+            vec!["cat".to_string(), self.path.clone()]
+        } else {
+            // use `sed` to read specific lines of a file
+            let start_line = self.start_line_one_indexed.unwrap_or(1);
+            let end_line = self.end_line_one_indexed_inclusive.unwrap_or(1);
+            vec![
+                "sed".to_string(),
+                "-n".to_string(),
+                format!("{start_line},{end_line}p"),
+                self.path.clone(),
+            ]
+        };
+        ExecParams {
+            command,
+            cwd: sess.resolve_path(None),
+            timeout_ms: None,
+            env: create_env(&sess.shell_environment_policy),
+        }
+    }
+    /// Validates the parameters to ensure logical consistency
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate line numbers when both are present
+        if let (Some(start_line), Some(end_line)) = (
+            self.start_line_one_indexed,
+            self.end_line_one_indexed_inclusive,
+        ) {
+            if start_line > end_line {
+                return Err(format!(
+                    "start_line_one_indexed ({start_line}) must be less than or equal to end_line_one_indexed_inclusive ({end_line})"
+                ));
+            }
+
+            // Validate that line numbers are valid (greater than 0)
+            if start_line == 0 {
+                return Err(
+                    "start_line_one_indexed must be greater than 0 (one-indexed)".to_string(),
+                );
+            }
+            if end_line == 0 {
+                return Err(
+                    "end_line_one_indexed_inclusive must be greater than 0 (one-indexed)"
+                        .to_string(),
+                );
+            }
+        }
+
+        // Validate that we have line numbers when not reading entire file
+        if !self.should_read_entire_file
+            && (self.start_line_one_indexed.is_none()
+                || self.end_line_one_indexed_inclusive.is_none())
+        {
+            return Err("start_line_one_indexed and end_line_one_indexed_inclusive are required when should_read_entire_file is false".to_string());
+        }
+
+        // Validate path is not empty
+        if self.path.trim().is_empty() {
+            return Err("path cannot be empty".to_string());
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +337,7 @@ impl std::ops::Deref for FunctionCallOutputPayload {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::openai_tools::ToJsonSchema;
 
     #[test]
     fn serializes_success_as_plain_string() {
@@ -294,9 +385,109 @@ mod tests {
             ShellToolCallParams {
                 command: vec!["ls".to_string(), "-l".to_string()],
                 workdir: Some("/tmp".to_string()),
-                timeout_ms: Some(1000),
+                timeout: Some(1000),
             },
             params
         );
+    }
+
+    #[test]
+    fn test_read_file_validation_valid_params() {
+        let params = ReadFileToolCallParams {
+            path: "test.txt".to_string(),
+            should_read_entire_file: false,
+            start_line_one_indexed: Some(1),
+            end_line_one_indexed_inclusive: Some(10),
+            explanation: None,
+        };
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn test_read_file_validation_start_greater_than_end() {
+        let params = ReadFileToolCallParams {
+            path: "test.txt".to_string(),
+            should_read_entire_file: false,
+            start_line_one_indexed: Some(10),
+            end_line_one_indexed_inclusive: Some(5),
+            explanation: None,
+        };
+        let result = params.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("start_line_one_indexed (10) must be less than or equal to end_line_one_indexed_inclusive (5)"));
+    }
+
+    #[test]
+    fn test_read_file_validation_zero_line_numbers() {
+        let params = ReadFileToolCallParams {
+            path: "test.txt".to_string(),
+            should_read_entire_file: false,
+            start_line_one_indexed: Some(0),
+            end_line_one_indexed_inclusive: Some(10),
+            explanation: None,
+        };
+        let result = params.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("start_line_one_indexed must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn test_read_file_validation_missing_line_numbers() {
+        let params = ReadFileToolCallParams {
+            path: "test.txt".to_string(),
+            should_read_entire_file: false,
+            start_line_one_indexed: None,
+            end_line_one_indexed_inclusive: Some(10),
+            explanation: None,
+        };
+        let result = params.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("start_line_one_indexed and end_line_one_indexed_inclusive are required")
+        );
+    }
+
+    #[test]
+    fn test_read_file_validation_empty_path() {
+        let params = ReadFileToolCallParams {
+            path: "".to_string(),
+            should_read_entire_file: true,
+            start_line_one_indexed: None,
+            end_line_one_indexed_inclusive: None,
+            explanation: None,
+        };
+        let result = params.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("path cannot be empty"));
+    }
+
+    #[test]
+    fn test_read_file_validation_read_entire_file() {
+        let params = ReadFileToolCallParams {
+            path: "test.txt".to_string(),
+            should_read_entire_file: true,
+            start_line_one_indexed: None,
+            end_line_one_indexed_inclusive: None,
+            explanation: None,
+        };
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn test_read_file_validation_equal_line_numbers() {
+        let params = ReadFileToolCallParams {
+            path: "test.txt".to_string(),
+            should_read_entire_file: false,
+            start_line_one_indexed: Some(5),
+            end_line_one_indexed_inclusive: Some(5),
+            explanation: None,
+        };
+        assert!(params.validate().is_ok());
     }
 }

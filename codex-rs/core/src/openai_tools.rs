@@ -1,10 +1,19 @@
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
+use tracing::debug;
 
 use crate::client_common::Prompt;
+use crate::models::ReadFileToolCallParams;
+use crate::models::ShellToolCallParams;
 use crate::plan_tool::PLAN_TOOL;
+
+/// Trait for types that can provide JSON schema for OpenAI tools
+pub trait ToJsonSchema {
+    fn to_json_schema() -> JsonSchema;
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ResponsesApiTool {
@@ -31,6 +40,7 @@ pub(crate) enum OpenAiTool {
 pub(crate) enum JsonSchema {
     String,
     Number,
+    Boolean,
     Array {
         items: Box<JsonSchema>,
     },
@@ -42,28 +52,31 @@ pub(crate) enum JsonSchema {
     },
 }
 
+/// Helper function to create an OpenAI tool from a struct that implements ToJsonSchema
+pub fn create_tool_from_struct<T>(name: &'static str, description: &'static str) -> OpenAiTool
+where
+    T: ToJsonSchema,
+{
+    OpenAiTool::Function(ResponsesApiTool {
+        name,
+        description,
+        strict: false,
+        parameters: T::to_json_schema(),
+    })
+}
+
 /// Tool usage specification
 static DEFAULT_TOOLS: LazyLock<Vec<OpenAiTool>> = LazyLock::new(|| {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "command".to_string(),
-        JsonSchema::Array {
-            items: Box::new(JsonSchema::String),
-        },
-    );
-    properties.insert("workdir".to_string(), JsonSchema::String);
-    properties.insert("timeout".to_string(), JsonSchema::Number);
-
-    vec![OpenAiTool::Function(ResponsesApiTool {
-        name: "shell",
-        description: "Runs a shell command, and returns its output.",
-        strict: false,
-        parameters: JsonSchema::Object {
-            properties,
-            required: &["command"],
-            additional_properties: false,
-        },
-    })]
+    vec![
+        create_tool_from_struct::<ShellToolCallParams>(
+            "execute_command",
+            "Runs a shell command, and returns its output.",
+        ),
+        create_tool_from_struct::<ReadFileToolCallParams>(
+            "read_file",
+            "Read the contents of a file at the specified path.",
+        ),
+    ]
 });
 
 static DEFAULT_CODEX_MODEL_TOOLS: LazyLock<Vec<OpenAiTool>> =
@@ -78,6 +91,7 @@ pub(crate) fn create_tools_json_for_responses_api(
     include_plan_tool: bool,
 ) -> crate::error::Result<Vec<serde_json::Value>> {
     // Assemble tool list: built-in tools + any extra tools from the prompt.
+    debug!("model: {:?}", model);
     let default_tools = if model.starts_with("codex") {
         &DEFAULT_CODEX_MODEL_TOOLS
     } else {
@@ -114,6 +128,8 @@ pub(crate) fn create_tools_json_for_chat_completions_api(
     // the chat completions tool call format.
     let responses_api_tools_json =
         create_tools_json_for_responses_api(prompt, model, include_plan_tool)?;
+
+    debug!("responses_api_tools_json: {:?}", responses_api_tools_json);
     let tools_json = responses_api_tools_json
         .into_iter()
         .filter_map(|mut tool| {

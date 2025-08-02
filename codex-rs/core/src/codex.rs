@@ -51,6 +51,7 @@ use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::models::ContentItem;
 use crate::models::FunctionCallOutputPayload;
 use crate::models::LocalShellAction;
+use crate::models::ReadFileToolCallParams;
 use crate::models::ReasoningItemReasoningSummary;
 use crate::models::ResponseInputItem;
 use crate::models::ResponseItem;
@@ -195,7 +196,7 @@ pub(crate) struct Session {
     user_instructions: Option<String>,
     pub(crate) approval_policy: AskForApproval,
     sandbox_policy: SandboxPolicy,
-    shell_environment_policy: ShellEnvironmentPolicy,
+    pub(crate) shell_environment_policy: ShellEnvironmentPolicy,
     pub(crate) writable_roots: Mutex<Vec<PathBuf>>,
     disable_response_storage: bool,
 
@@ -215,7 +216,7 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    fn resolve_path(&self, path: Option<String>) -> PathBuf {
+    pub fn resolve_path(&self, path: Option<String>) -> PathBuf {
         path.as_ref()
             .map(PathBuf::from)
             .map_or_else(|| self.cwd.clone(), |p| self.cwd.join(p))
@@ -684,7 +685,8 @@ async fn submission_loop(
                         });
                     }
                 }
-                let default_shell = shell::default_user_shell().await;
+                let default_shell = shell::default_user_shell().await; // default_shell is Unknown
+                debug!("default_shell: {:?}", default_shell);
                 sess = Some(Arc::new(Session {
                     client,
                     tx_event: tx_event.clone(),
@@ -1190,6 +1192,7 @@ async fn try_run_turn(
             }
         };
 
+        debug!("event in try_run_turn: {:?}", event);
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(item) => {
@@ -1283,7 +1286,7 @@ async fn handle_response_item(
             let params = ShellToolCallParams {
                 command: action.command,
                 workdir: action.working_directory,
-                timeout_ms: action.timeout_ms,
+                timeout: action.timeout_ms,
             };
             let effective_call_id = match (call_id, id) {
                 (Some(call_id), _) => call_id,
@@ -1328,7 +1331,7 @@ async fn handle_function_call(
     call_id: String,
 ) -> ResponseInputItem {
     match name.as_str() {
-        "container.exec" | "shell" => {
+        "container.exec" | "execute_command" => {
             let params = match parse_container_exec_arguments(arguments, sess, &call_id) {
                 Ok(params) => params,
                 Err(output) => {
@@ -1336,6 +1339,16 @@ async fn handle_function_call(
                 }
             };
             handle_container_exec_with_params(params, sess, sub_id, call_id).await
+        }
+        "read_file" => {
+            let params = match parse_read_file_arguments(arguments, &call_id) {
+                Ok(params) => params,
+                Err(output) => {
+                    return *output;
+                }
+            };
+            let exec_params = params.to_exec_params(sess);
+            handle_container_exec_with_params(exec_params, sess, sub_id, call_id).await
         }
         "update_plan" => handle_update_plan(sess, arguments, sub_id, call_id).await,
         _ => {
@@ -1367,19 +1380,58 @@ fn to_exec_params(params: ShellToolCallParams, sess: &Session) -> ExecParams {
     ExecParams {
         command: params.command,
         cwd: sess.resolve_path(params.workdir.clone()),
-        timeout_ms: params.timeout_ms,
+        timeout_ms: params.timeout,
         env: create_env(&sess.shell_environment_policy),
     }
 }
 
 fn parse_container_exec_arguments(
-    arguments: String,
+    arguments: String, // json string parameters from assistant message
     sess: &Session,
     call_id: &str,
 ) -> Result<ExecParams, Box<ResponseInputItem>> {
     // parse command
     match serde_json::from_str::<ShellToolCallParams>(&arguments) {
-        Ok(shell_tool_call_params) => Ok(to_exec_params(shell_tool_call_params, sess)),
+        Ok(shell_tool_call_params) => Ok(shell_tool_call_params.to_exec_params(sess)),
+        Err(e) => {
+            // allow model to re-sample
+            let output = ResponseInputItem::FunctionCallOutput {
+                call_id: call_id.to_string(),
+                output: FunctionCallOutputPayload {
+                    content: format!("failed to parse function arguments: {e}"),
+                    success: None,
+                },
+            };
+            Err(Box::new(output))
+        }
+    }
+}
+
+// parse_read_file_arguments parses json parameters from assistant message
+// we will parse ReadFileToolCallParams to ExecParams to reuse command execution logic
+fn parse_read_file_arguments(
+    arguments: String, // json string parameters from assistant message
+    call_id: &str,
+) -> Result<ReadFileToolCallParams, Box<ResponseInputItem>> {
+    // parse read_file parameters
+    match serde_json::from_str::<ReadFileToolCallParams>(&arguments) {
+        Ok(read_file_params) => {
+            // Validate the parameters
+            match read_file_params.validate() {
+                Ok(()) => Ok(read_file_params),
+                Err(validation_error) => {
+                    // Return validation error to allow model to re-sample
+                    let output = ResponseInputItem::FunctionCallOutput {
+                        call_id: call_id.to_string(),
+                        output: FunctionCallOutputPayload {
+                            content: format!("validation error: {}", validation_error),
+                            success: None,
+                        },
+                    };
+                    Err(Box::new(output))
+                }
+            }
+        }
         Err(e) => {
             // allow model to re-sample
             let output = ResponseInputItem::FunctionCallOutput {

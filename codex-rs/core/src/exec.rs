@@ -1,8 +1,7 @@
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
-
 use std::collections::HashMap;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -10,6 +9,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tracing::debug;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -374,10 +374,6 @@ async fn spawn_child_async(
     stdio_policy: StdioPolicy,
     env: HashMap<String, String>,
 ) -> std::io::Result<Child> {
-    trace!(
-        "spawn_child_async: {program:?} {args:?} {arg0:?} {cwd:?} {sandbox_policy:?} {stdio_policy:?} {env:?}"
-    );
-
     let mut cmd = Command::new(&program);
     #[cfg(unix)]
     cmd.arg0(arg0.map_or_else(|| program.to_string_lossy().to_string(), String::from));
