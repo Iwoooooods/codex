@@ -182,9 +182,8 @@ impl From<Vec<InputItem>> for ResponseInputItem {
 pub struct ShellToolCallParams {
     /// The shell command to execute as an array of arguments
     pub command: Vec<String>,
-    /// Optional working directory for the command execution
+    /// The directory that the command will be running under, default to be the root of this workspace.
     pub workdir: Option<String>,
-
     /// This is the maximum time in milliseconds that the command is allowed to run.
     pub timeout: Option<u64>,
     /// Optional explanation of what the command is intended to do
@@ -204,15 +203,15 @@ impl ShellToolCallParams {
 
 #[derive(macros::ToolSchema, Deserialize, Debug, Clone, PartialEq)]
 pub struct ReadFileToolCallParams {
-    /// The path of the file to read
+    /// The path of the file to read (relative to the current working directory \${cwd.toPosix()}).
     pub path: String,
-    /// Whether to read the entire file or just specific lines
+    /// Whether to read the entire file. You should alway tell if we need to read the entire file.
     pub should_read_entire_file: bool,
-    /// The one-indexed line number to start reading from (required if should_read_entire_file is false)
+    /// The one-indexed line number to start reading from (inclusive).
     pub start_line_one_indexed: Option<u64>,
-    /// The one-indexed line number to end reading at, inclusive (required if should_read_entire_file is false)
+    /// The one-indexed line number to end reading at (inclusive).
     pub end_line_one_indexed_inclusive: Option<u64>,
-    /// Optional explanation of why this file is being read
+    /// One sentence explanation as to why this tool is being used, and how it contributes to the goal.
     pub explanation: Option<String>,
 }
 
@@ -353,6 +352,90 @@ impl RegexSearchToolCallParams {
             }
         }
 
+        Ok(())
+    }
+}
+
+#[derive(macros::ToolSchema, Deserialize, Debug, Clone, PartialEq)]
+pub struct FuzzySearchToolCallParams {
+    /// Fuzzy filename to search for
+    pub query: String,
+    /// One sentence explanation as to why this tool is being used, and how it contributes to the goal.
+    pub explanation: Option<String>,
+}
+
+impl FuzzySearchToolCallParams {
+    pub(crate) async fn execute(&self, sess: &Session) -> anyhow::Result<String> {
+        use std::num::NonZero;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        // Set reasonable defaults for fuzzy search
+
+        let limit = match NonZero::new(10) {
+            Some(limit) => limit,
+            None => return Err(anyhow::anyhow!("Invalid limit: 10 should be non-zero")),
+        };
+        // Return top 10 matches
+        let search_directory = &sess.cwd;
+        let exclude: Vec<String> = vec![];
+        let threads = match NonZero::new(4) {
+            Some(threads) => threads,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Invalid thread count: 4 should be non-zero"
+                ));
+            }
+        }; // Use 4 threads for good performance
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let compute_indices = false; // We don't need highlighting indices for tool output
+
+        // Call the file-search library directly
+        let results = codex_file_search::run(
+            &self.query,
+            limit,
+            search_directory,
+            exclude,
+            threads,
+            cancel_flag,
+            compute_indices,
+        )?;
+
+        // Format the results for the AI model
+        if results.matches.is_empty() {
+            Ok(format!(
+                "No files found matching pattern: \"{}\"",
+                self.query
+            ))
+        } else {
+            let total_count = results.total_match_count;
+            let shown_count = results.matches.len();
+
+            let mut output =
+                format!("Found {total_count} matching files (showing top {shown_count}):\n");
+
+            for file_match in &results.matches {
+                output.push_str(&format!(
+                    "- {} (score: {})\n",
+                    file_match.path, file_match.score
+                ));
+            }
+
+            if total_count > shown_count {
+                output.push_str(&format!(
+                    "\n... and {} more matches not shown",
+                    total_count - shown_count
+                ));
+            }
+
+            Ok(output)
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.query.trim().is_empty() {
+            return Err("Query cannot be empty".to_string());
+        }
         Ok(())
     }
 }
@@ -570,6 +653,24 @@ mod tests {
             start_line_one_indexed: Some(5),
             end_line_one_indexed_inclusive: Some(5),
             explanation: None,
+        };
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fuzzy_search_validation_empty_query() {
+        let params = FuzzySearchToolCallParams {
+            query: "".to_string(),
+            explanation: None,
+        };
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn test_fuzzy_search_validation_valid_params() {
+        let params = FuzzySearchToolCallParams {
+            query: "test.rs".to_string(),
+            explanation: Some("Searching for test files".to_string()),
         };
         assert!(params.validate().is_ok());
     }

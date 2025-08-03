@@ -17,6 +17,7 @@ members = [
     "mcp-types",
     "macros",
     "tui",
+    "codebase-search",
 ]
 
 [workspace.package]

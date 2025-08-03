@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 use tracing::debug;
 
 use crate::client_common::Prompt;
+use crate::models::FuzzySearchToolCallParams;
 use crate::models::ReadFileToolCallParams;
 use crate::models::RegexSearchToolCallParams;
 use crate::models::ShellToolCallParams;
@@ -95,6 +96,10 @@ static DEFAULT_TOOLS: LazyLock<Vec<OpenAiTool>> = LazyLock::new(|| {
         create_tool_from_struct::<RegexSearchToolCallParams>(
             "regex_search",
             "Searches for regex patterns in files using ripgrep. Returns up to 50 matches with support for case sensitivity, file inclusion/exclusion patterns.",
+        ),
+        create_tool_from_struct::<FuzzySearchToolCallParams>(
+            "file_search",
+            "Fast file search based on fuzzy matching against file path. Use if you know part of the file path but don't know where it's located exactly. Response will be capped to 10 results. Make your query more specific if need to filter results further.",
         ),
     ]
 });

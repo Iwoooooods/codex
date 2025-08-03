@@ -50,6 +50,7 @@ use crate::mcp_connection_manager::McpConnectionManager;
 use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::models::ContentItem;
 use crate::models::FunctionCallOutputPayload;
+use crate::models::FuzzySearchToolCallParams;
 use crate::models::LocalShellAction;
 use crate::models::ReadFileToolCallParams;
 use crate::models::ReasoningItemReasoningSummary;
@@ -1362,6 +1363,32 @@ async fn handle_function_call(
             let exec_params = params.to_exec_params(sess);
             handle_container_exec_with_params(exec_params, sess, sub_id, call_id).await
         }
+        "file_search" => {
+            let params = match parse_fuzzy_search_arguments(arguments, &call_id) {
+                Ok(params) => params,
+                Err(output) => {
+                    return *output;
+                }
+            };
+
+            // Execute fuzzy search directly using the library
+            match params.execute(sess).await {
+                Ok(output) => ResponseInputItem::FunctionCallOutput {
+                    call_id,
+                    output: FunctionCallOutputPayload {
+                        content: output,
+                        success: Some(true),
+                    },
+                },
+                Err(err) => ResponseInputItem::FunctionCallOutput {
+                    call_id,
+                    output: FunctionCallOutputPayload {
+                        content: format!("fuzzy_search error: {err}"),
+                        success: Some(false),
+                    },
+                },
+            }
+        }
         "update_plan" => handle_update_plan(sess, arguments, sub_id, call_id).await,
         _ => {
             match sess.mcp_connection_manager.parse_tool_name(&name) {
@@ -1470,6 +1497,45 @@ fn parse_regex_search_arguments(
             // Validate the parameters
             match regex_search_params.validate() {
                 Ok(()) => Ok(regex_search_params),
+                Err(validation_error) => {
+                    // Return validation error to allow model to re-sample
+                    let output = ResponseInputItem::FunctionCallOutput {
+                        call_id: call_id.to_string(),
+                        output: FunctionCallOutputPayload {
+                            content: format!("validation error: {validation_error}"),
+                            success: None,
+                        },
+                    };
+                    Err(Box::new(output))
+                }
+            }
+        }
+        Err(e) => {
+            // allow model to re-sample
+            let output = ResponseInputItem::FunctionCallOutput {
+                call_id: call_id.to_string(),
+                output: FunctionCallOutputPayload {
+                    content: format!("failed to parse function arguments: {e}"),
+                    success: None,
+                },
+            };
+            Err(Box::new(output))
+        }
+    }
+}
+
+// parse_fuzzy_search_arguments parses json parameters from assistant message
+// we will parse FuzzySearchToolCallParams to ExecParams to reuse command execution logic
+fn parse_fuzzy_search_arguments(
+    arguments: String, // json string parameters from assistant message
+    call_id: &str,
+) -> Result<FuzzySearchToolCallParams, Box<ResponseInputItem>> {
+    // parse fuzzy_search parameters
+    match serde_json::from_str::<FuzzySearchToolCallParams>(&arguments) {
+        Ok(fuzzy_search_params) => {
+            // Validate the parameters
+            match fuzzy_search_params.validate() {
+                Ok(()) => Ok(fuzzy_search_params),
                 Err(validation_error) => {
                     // Return validation error to allow model to re-sample
                     let output = ResponseInputItem::FunctionCallOutput {
