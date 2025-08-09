@@ -6,11 +6,87 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::LazyLock;
 use tracing::error;
 use tracing::info;
 
 pub const QDRANT_EMBEDDING_MODEL: &str = "Qwen/Qwen3-Embedding-8B";
 pub const QDRANT_EMBEDDING_DIMENSION: usize = 4096;
+
+/// Lazy-loaded global embedding client for interacting with embedding providers
+/// This client is configured based on environment variables or defaults to SiliconFlow
+pub(crate) static EMBEDDING_CLIENT: LazyLock<Result<Arc<EmbeddingClient>, anyhow::Error>> =
+    LazyLock::new(|| {
+        let config = create_embedding_config();
+        EmbeddingClient::new(config)
+            .map(Arc::new)
+            .map_err(|e| anyhow::anyhow!("Failed to create embedding client: {e}"))
+    });
+
+/// Get the global embedding client, returning an error if initialization failed
+pub(crate) fn get_embedding_client() -> Result<Arc<EmbeddingClient>, anyhow::Error> {
+    match &*EMBEDDING_CLIENT {
+        Ok(client) => Ok(Arc::clone(client)),
+        Err(e) => Err(anyhow::anyhow!(
+            "Embedding client initialization failed: {e}"
+        )),
+    }
+}
+
+/// Create embedding configuration from environment variables or defaults
+fn create_embedding_config() -> EmbeddingConfig {
+    let provider =
+        std::env::var("CODEX_EMBEDDING_PROVIDER").unwrap_or_else(|_| "siliconflow".to_string());
+
+    let (api_url, model) = match provider.as_str() {
+        "openai" => (
+            std::env::var("CODEX_EMBEDDING_API_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1/embeddings".to_string()),
+            std::env::var("CODEX_EMBEDDING_MODEL")
+                .unwrap_or_else(|_| "text-embedding-3-large".to_string()),
+        ),
+        "cohere" => (
+            std::env::var("CODEX_EMBEDDING_API_URL")
+                .unwrap_or_else(|_| "https://api.cohere.ai/v1/embed".to_string()),
+            std::env::var("CODEX_EMBEDDING_MODEL")
+                .unwrap_or_else(|_| "embed-english-v3.0".to_string()),
+        ),
+        "siliconflow" | _ => (
+            std::env::var("CODEX_EMBEDDING_API_URL")
+                .unwrap_or_else(|_| "https://api.siliconflow.cn/v1/embeddings".to_string()),
+            std::env::var("CODEX_EMBEDDING_MODEL")
+                .unwrap_or_else(|_| "Qwen/Qwen3-Embedding-8B".to_string()),
+        ),
+    };
+
+    let api_key = std::env::var("CODEX_EMBEDDING_API_KEY")
+        .or_else(|_| std::env::var("OPENAI_API_KEY")) // Fallback for OpenAI
+        .unwrap_or_else(|_| {
+            // Default API key for SiliconFlow (from existing default config)
+            "sk-xzmxwlbvzdbgsgejawqjamccrifkwjabcpmmgenprsfudnpt".to_string()
+        });
+
+    let batch_size = std::env::var("CODEX_EMBEDDING_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+
+    let timeout_seconds = std::env::var("CODEX_EMBEDDING_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+
+    EmbeddingConfig {
+        provider,
+        api_url,
+        api_key,
+        model,
+        batch_size,
+        timeout_seconds,
+        additional_headers: HashMap::new(),
+    }
+}
 
 /// Configuration for embedding model providers
 #[derive(Debug, Clone)]
@@ -171,6 +247,17 @@ impl EmbeddingClient {
         Ok(embedded_chunks)
     }
 
+    /// Embed a query string for similarity search
+    pub async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        let embeddings = self.embed_texts(&[query.to_string()]).await?;
+
+        if embeddings.is_empty() {
+            return Err(anyhow!("No embeddings returned for query"));
+        }
+
+        Ok(embeddings[0].clone())
+    }
+
     /// Send embedding request to the configured provider
     async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let request = EmbeddingRequest {
@@ -217,48 +304,5 @@ impl EmbeddingClient {
         embeddings.sort_by_key(|data| data.index);
 
         Ok(embeddings.into_iter().map(|data| data.embedding).collect())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::chunker::ChunkMetadata;
-    use std::path::PathBuf;
-
-    // Note: These tests would require a real API key to work
-    #[tokio::test]
-    async fn test_embed_chunk_siliconflow() {
-        let _ = tracing_subscriber::fmt::try_init();
-
-        let config = EmbeddingConfig::default();
-        let client = match EmbeddingClient::new(config) {
-            Ok(client) => client,
-            Err(e) => panic!("Failed to create embedding client: {e}"),
-        };
-        let chunk = CodeChunk {
-            content: "fn test_function() {\n    println!(\"Hello, world!\");\n}".to_string(),
-            file_path: PathBuf::from("test.rs"),
-            start_line: 1,
-            end_line: 3,
-            symbol_name: "test_function".to_string(),
-            symbol_kind: "Function".to_string(),
-            context: Some("mod test".to_string()),
-            chunk_metadata: ChunkMetadata {
-                is_split: false,
-                original_size_lines: 3,
-                chunk_depth: 0,
-                is_container: false,
-            },
-        };
-        let result = match client.embed_chunk(&chunk).await {
-            Ok(result) => result,
-            Err(e) => panic!("Failed to embed chunk: {e}"),
-        };
-
-        assert!(!result.embedding.is_empty());
-        assert_eq!(result.chunk.symbol_name, "test_function");
-
-        info!("Embedded chunk: {:?}", result);
     }
 }

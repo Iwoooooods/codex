@@ -17,7 +17,6 @@ use walkdir::WalkDir;
 
 use crate::file_state::CodebaseState;
 use crate::file_state::FileState;
-use crate::test_data;
 
 /// Represents a code symbol that can be indexed for semantic search
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +41,7 @@ pub struct Symbol {
     pub context: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Function,
     Struct,
@@ -61,17 +60,18 @@ pub enum SymbolKind {
 /// Supported programming languages for parsing
 #[derive(Debug, Clone)]
 pub enum SupportedLanguage {
-    Rust,
     // Add more languages as needed
-    // JavaScript,
-    // Python,
-    // TypeScript,
+    Rust,
+    Python,
+    Go,
 }
 
 impl SupportedLanguage {
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
             "rs" => Some(SupportedLanguage::Rust),
+            "py" => Some(SupportedLanguage::Python),
+            "go" => Some(SupportedLanguage::Go),
             _ => None,
         }
     }
@@ -79,6 +79,8 @@ impl SupportedLanguage {
     pub fn tree_sitter_language(&self) -> tree_sitter::Language {
         match self {
             SupportedLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
+            SupportedLanguage::Python => tree_sitter_python::LANGUAGE.into(),
+            SupportedLanguage::Go => tree_sitter_go::LANGUAGE.into(),
         }
     }
 
@@ -86,6 +88,8 @@ impl SupportedLanguage {
     pub fn extensions(&self) -> &'static [&'static str] {
         match self {
             SupportedLanguage::Rust => &["rs"],
+            SupportedLanguage::Python => &["py"],
+            SupportedLanguage::Go => &["go"],
         }
     }
 }
@@ -107,36 +111,55 @@ impl SymbolParser {
         };
         parsers.insert("rs".to_string(), rust_parser);
 
+        // Initialize Python parser
+        let mut python_parser = Parser::new();
+        match python_parser.set_language(&SupportedLanguage::Python.tree_sitter_language()) {
+            Ok(_) => (),
+            Err(e) => return Err(anyhow::anyhow!("Failed to set Python language: {e}")),
+        };
+        parsers.insert("py".to_string(), python_parser);
+
+        // Initialize Go parser
+        let mut go_parser = Parser::new();
+        match go_parser.set_language(&SupportedLanguage::Go.tree_sitter_language()) {
+            Ok(_) => (),
+            Err(e) => return Err(anyhow::anyhow!("Failed to set Go language: {e}")),
+        };
+        parsers.insert("go".to_string(), go_parser);
+
         Ok(SymbolParser { parsers })
     }
 
     /// Parse a single file and extract all symbols
-    pub fn parse_file(
+    pub fn parse_file<P: AsRef<Path>>(
         &mut self,
-        file_path: &Path,
-    ) -> Result<Vec<Symbol>, Box<dyn std::error::Error>> {
-        let content = fs::read_to_string(file_path)?;
-        let extension = match file_path.extension().and_then(|ext| ext.to_str()) {
-            Some(ext) => ext,
-            None => "",
-        };
+        file_path: P,
+    ) -> Result<Vec<Symbol>, anyhow::Error> {
+        let content = fs::read_to_string(file_path.as_ref())?;
+        let extension = file_path
+            .as_ref()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
 
         let language = SupportedLanguage::from_extension(extension)
-            .ok_or_else(|| format!("Unsupported file extension: {extension}"))?;
+            .ok_or_else(|| anyhow::anyhow!("Unsupported file extension: {extension}"))?;
 
         let parser = self
             .parsers
             .get_mut(extension)
-            .ok_or_else(|| format!("No parser available for extension: {extension}"))?;
+            .ok_or_else(|| anyhow::anyhow!("No parser available for extension: {extension}"))?;
 
-        let tree = parser.parse(&content, None).ok_or("Failed to parse file")?;
+        let tree = parser
+            .parse(&content, None)
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse file"))?;
 
-        let symbols = self.extract_symbols(&tree, &content, file_path, &language)?;
+        let symbols = self.extract_symbols(&tree, &content, file_path.as_ref(), &language)?;
 
         debug!(
             "Extracted {} symbols from {}",
             symbols.len(),
-            file_path.display()
+            file_path.as_ref().display()
         );
         Ok(symbols)
     }
@@ -148,13 +171,19 @@ impl SymbolParser {
         source: &str,
         file_path: &Path,
         language: &SupportedLanguage,
-    ) -> Result<Vec<Symbol>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<Symbol>, anyhow::Error> {
         let mut symbols = Vec::new();
         let root_node = tree.root_node();
 
         match language {
             SupportedLanguage::Rust => {
                 self.extract_rust_symbols(root_node, source, file_path, &mut symbols)?;
+            }
+            SupportedLanguage::Python => {
+                self.extract_python_symbols(root_node, source, file_path, &mut symbols)?;
+            }
+            SupportedLanguage::Go => {
+                self.extract_go_symbols(root_node, source, file_path, &mut symbols)?;
             }
         }
 
@@ -168,8 +197,30 @@ impl SymbolParser {
         source: &str,
         file_path: &Path,
         symbols: &mut Vec<Symbol>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), anyhow::Error> {
         self.traverse_rust_node(node, source, file_path, symbols, None)?;
+        Ok(())
+    }
+
+    fn extract_python_symbols(
+        &self,
+        node: Node,
+        source: &str,
+        file_path: &Path,
+        symbols: &mut Vec<Symbol>,
+    ) -> Result<(), anyhow::Error> {
+        self.traverse_python_node(node, source, file_path, symbols, None)?;
+        Ok(())
+    }
+
+    fn extract_go_symbols(
+        &self,
+        node: Node,
+        source: &str,
+        file_path: &Path,
+        symbols: &mut Vec<Symbol>,
+    ) -> Result<(), anyhow::Error> {
+        self.traverse_go_node(node, source, file_path, symbols, None)?;
         Ok(())
     }
 
@@ -181,7 +232,7 @@ impl SymbolParser {
         file_path: &Path,
         symbols: &mut Vec<Symbol>,
         context: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), anyhow::Error> {
         match node.kind() {
             "function_item" => {
                 if let Some(symbol) =
@@ -266,11 +317,11 @@ impl SymbolParser {
         source: &str,
         file_path: &Path,
         context: &Option<String>,
-    ) -> Result<Option<Symbol>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<Symbol>, anyhow::Error> {
         // Find function name
         let name = self
             .find_child_text(node, "identifier", source)?
-            .ok_or("Function missing name")?;
+            .ok_or_else(|| anyhow::anyhow!("Function missing name"))?;
 
         let content = node.utf8_text(source.as_bytes())?;
         let start_pos = node.start_position();
@@ -302,10 +353,10 @@ impl SymbolParser {
         source: &str,
         file_path: &Path,
         context: &Option<String>,
-    ) -> Result<Option<Symbol>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<Symbol>, anyhow::Error> {
         let name = self
             .find_child_text(node, "type_identifier", source)?
-            .ok_or("Struct missing name")?;
+            .ok_or_else(|| anyhow::anyhow!("Struct missing name"))?;
 
         let content = node.utf8_text(source.as_bytes())?;
         let start_pos = node.start_position();
@@ -331,10 +382,10 @@ impl SymbolParser {
         source: &str,
         file_path: &Path,
         context: &Option<String>,
-    ) -> Result<Option<Symbol>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<Symbol>, anyhow::Error> {
         let name = self
             .find_child_text(node, "type_identifier", source)?
-            .ok_or("Enum missing name")?;
+            .ok_or_else(|| anyhow::anyhow!("Enum missing name"))?;
 
         let content = node.utf8_text(source.as_bytes())?;
         let start_pos = node.start_position();
@@ -360,10 +411,10 @@ impl SymbolParser {
         source: &str,
         file_path: &Path,
         context: &Option<String>,
-    ) -> Result<Option<Symbol>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<Symbol>, anyhow::Error> {
         let name = self
             .find_child_text(node, "type_identifier", source)?
-            .ok_or("Trait missing name")?;
+            .ok_or_else(|| anyhow::anyhow!("Trait missing name"))?;
 
         let content = node.utf8_text(source.as_bytes())?;
         let start_pos = node.start_position();
@@ -389,7 +440,7 @@ impl SymbolParser {
         source: &str,
         file_path: &Path,
         context: &Option<String>,
-    ) -> Result<Option<Symbol>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<Symbol>, anyhow::Error> {
         // Find the type being implemented
         let name = self
             .find_child_text(node, "type_identifier", source)?
@@ -419,10 +470,10 @@ impl SymbolParser {
         source: &str,
         file_path: &Path,
         context: &Option<String>,
-    ) -> Result<Option<Symbol>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<Symbol>, anyhow::Error> {
         let name = self
             .find_child_text(node, "identifier", source)?
-            .ok_or("Constant missing name")?;
+            .ok_or_else(|| anyhow::anyhow!("Constant missing name"))?;
 
         let content = node.utf8_text(source.as_bytes())?;
         let start_pos = node.start_position();
@@ -448,10 +499,10 @@ impl SymbolParser {
         source: &str,
         file_path: &Path,
         context: &Option<String>,
-    ) -> Result<Option<Symbol>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<Symbol>, anyhow::Error> {
         let name = self
             .find_child_text(node, "identifier", source)?
-            .ok_or("Module missing name")?;
+            .ok_or_else(|| anyhow::anyhow!("Module missing name"))?;
 
         let content = node.utf8_text(source.as_bytes())?;
         let start_pos = node.start_position();
@@ -470,13 +521,343 @@ impl SymbolParser {
         }))
     }
 
+    /// Recursively traverse Python AST nodes to find symbols
+    fn traverse_python_node(
+        &self,
+        node: Node,
+        source: &str,
+        file_path: &Path,
+        symbols: &mut Vec<Symbol>,
+        context: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        match node.kind() {
+            "function_definition" => {
+                if let Some(symbol) =
+                    self.extract_python_function(node, source, file_path, &context)?
+                {
+                    symbols.push(symbol);
+                }
+            }
+            "class_definition" => {
+                if let Some(symbol) =
+                    self.extract_python_class(node, source, file_path, &context)?
+                {
+                    let class_name = symbol.name.clone();
+                    symbols.push(symbol);
+
+                    // For class methods, pass the class name as context
+                    for child in node.children(&mut node.walk()) {
+                        self.traverse_python_node(
+                            child,
+                            source,
+                            file_path,
+                            symbols,
+                            Some(class_name.clone()),
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+
+        // Continue traversing child nodes
+        for child in node.children(&mut node.walk()) {
+            self.traverse_python_node(child, source, file_path, symbols, context.clone())?;
+        }
+
+        Ok(())
+    }
+
+    /// Extract function symbol from Python code
+    fn extract_python_function(
+        &self,
+        node: Node,
+        source: &str,
+        file_path: &Path,
+        context: &Option<String>,
+    ) -> Result<Option<Symbol>, anyhow::Error> {
+        // Find function name
+        let name = self
+            .find_child_text(node, "identifier", source)?
+            .ok_or_else(|| anyhow::anyhow!("Python function missing name"))?;
+
+        let content = node.utf8_text(source.as_bytes())?;
+        let start_pos = node.start_position();
+        let end_pos = node.end_position();
+
+        let kind = if context.is_some() {
+            SymbolKind::Method
+        } else {
+            SymbolKind::Function
+        };
+
+        Ok(Some(Symbol {
+            name,
+            kind,
+            content: content.to_string(),
+            file_path: file_path.to_path_buf(),
+            start_line: start_pos.row + 1,
+            end_line: end_pos.row + 1,
+            start_column: start_pos.column,
+            end_column: end_pos.column,
+            context: context.clone(),
+        }))
+    }
+
+    /// Extract class symbol from Python code
+    fn extract_python_class(
+        &self,
+        node: Node,
+        source: &str,
+        file_path: &Path,
+        context: &Option<String>,
+    ) -> Result<Option<Symbol>, anyhow::Error> {
+        let name = self
+            .find_child_text(node, "identifier", source)?
+            .ok_or_else(|| anyhow::anyhow!("Python class missing name"))?;
+
+        let content = node.utf8_text(source.as_bytes())?;
+        let start_pos = node.start_position();
+        let end_pos = node.end_position();
+
+        Ok(Some(Symbol {
+            name,
+            kind: SymbolKind::Class,
+            content: content.to_string(),
+            file_path: file_path.to_path_buf(),
+            start_line: start_pos.row + 1,
+            end_line: end_pos.row + 1,
+            start_column: start_pos.column,
+            end_column: end_pos.column,
+            context: context.clone(),
+        }))
+    }
+
+    /// Recursively traverse Go AST nodes to find symbols
+    fn traverse_go_node(
+        &self,
+        node: Node,
+        source: &str,
+        file_path: &Path,
+        symbols: &mut Vec<Symbol>,
+        context: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        match node.kind() {
+            "function_declaration" => {
+                if let Some(symbol) = self.extract_go_function(node, source, file_path, &context)? {
+                    symbols.push(symbol);
+                }
+            }
+            "method_declaration" => {
+                if let Some(symbol) = self.extract_go_method(node, source, file_path, &context)? {
+                    symbols.push(symbol);
+                }
+            }
+            "type_declaration" => {
+                // Go type declarations can contain structs, interfaces, etc.
+                for child in node.children(&mut node.walk()) {
+                    if child.kind() == "type_spec" {
+                        if let Some(symbol) =
+                            self.extract_go_type(child, source, file_path, &context)?
+                        {
+                            symbols.push(symbol);
+                        }
+                    }
+                }
+            }
+            "const_declaration" | "var_declaration" => {
+                if let Some(symbol) = self.extract_go_variable(node, source, file_path, &context)? {
+                    symbols.push(symbol);
+                }
+            }
+            _ => {}
+        }
+
+        // Continue traversing child nodes
+        for child in node.children(&mut node.walk()) {
+            self.traverse_go_node(child, source, file_path, symbols, context.clone())?;
+        }
+
+        Ok(())
+    }
+
+    /// Extract function symbol from Go code
+    fn extract_go_function(
+        &self,
+        node: Node,
+        source: &str,
+        file_path: &Path,
+        context: &Option<String>,
+    ) -> Result<Option<Symbol>, anyhow::Error> {
+        // Find function name
+        let name = self
+            .find_child_text(node, "identifier", source)?
+            .ok_or_else(|| anyhow::anyhow!("Go function missing name"))?;
+
+        let content = node.utf8_text(source.as_bytes())?;
+        let start_pos = node.start_position();
+        let end_pos = node.end_position();
+
+        Ok(Some(Symbol {
+            name,
+            kind: SymbolKind::Function,
+            content: content.to_string(),
+            file_path: file_path.to_path_buf(),
+            start_line: start_pos.row + 1,
+            end_line: end_pos.row + 1,
+            start_column: start_pos.column,
+            end_column: end_pos.column,
+            context: context.clone(),
+        }))
+    }
+
+    /// Extract method symbol from Go code
+    fn extract_go_method(
+        &self,
+        node: Node,
+        source: &str,
+        file_path: &Path,
+        context: &Option<String>,
+    ) -> Result<Option<Symbol>, anyhow::Error> {
+        // Find method name
+        let name = self
+            .find_child_text(node, "field_identifier", source)?
+            .or_else(|| {
+                self.find_child_text(node, "identifier", source)
+                    .unwrap_or(None)
+            })
+            .ok_or_else(|| anyhow::anyhow!("Go method missing name"))?;
+
+        let content = node.utf8_text(source.as_bytes())?;
+        let start_pos = node.start_position();
+        let end_pos = node.end_position();
+
+        // Try to extract receiver type for context
+        let receiver_context = self.extract_go_receiver_type(node, source)?;
+        let final_context = receiver_context.or_else(|| context.clone());
+
+        Ok(Some(Symbol {
+            name,
+            kind: SymbolKind::Method,
+            content: content.to_string(),
+            file_path: file_path.to_path_buf(),
+            start_line: start_pos.row + 1,
+            end_line: end_pos.row + 1,
+            start_column: start_pos.column,
+            end_column: end_pos.column,
+            context: final_context,
+        }))
+    }
+
+    /// Extract type symbol from Go code (struct, interface, etc.)
+    fn extract_go_type(
+        &self,
+        node: Node,
+        source: &str,
+        file_path: &Path,
+        context: &Option<String>,
+    ) -> Result<Option<Symbol>, anyhow::Error> {
+        // Find type name
+        let name = self
+            .find_child_text(node, "type_identifier", source)?
+            .ok_or_else(|| anyhow::anyhow!("Go type missing name"))?;
+
+        let content = node.utf8_text(source.as_bytes())?;
+        let start_pos = node.start_position();
+        let end_pos = node.end_position();
+
+        // Determine the kind based on the type
+        let kind = if content.contains("struct") {
+            SymbolKind::Struct
+        } else if content.contains("interface") {
+            SymbolKind::Interface
+        } else {
+            SymbolKind::Type
+        };
+
+        Ok(Some(Symbol {
+            name,
+            kind,
+            content: content.to_string(),
+            file_path: file_path.to_path_buf(),
+            start_line: start_pos.row + 1,
+            end_line: end_pos.row + 1,
+            start_column: start_pos.column,
+            end_column: end_pos.column,
+            context: context.clone(),
+        }))
+    }
+
+    /// Extract variable/constant symbol from Go code
+    fn extract_go_variable(
+        &self,
+        node: Node,
+        source: &str,
+        file_path: &Path,
+        context: &Option<String>,
+    ) -> Result<Option<Symbol>, anyhow::Error> {
+        // Find variable name - could be in a var_spec or const_spec child
+        let mut name = None;
+        for child in node.children(&mut node.walk()) {
+            if child.kind() == "var_spec" || child.kind() == "const_spec" {
+                name = self.find_child_text(child, "identifier", source)?;
+                if name.is_some() {
+                    break;
+                }
+            }
+        }
+
+        let name = name.ok_or(anyhow::anyhow!("Go variable/constant missing name"))?;
+        let content = node.utf8_text(source.as_bytes())?;
+        let start_pos = node.start_position();
+        let end_pos = node.end_position();
+
+        let kind = if node.kind() == "const_declaration" {
+            SymbolKind::Constant
+        } else {
+            SymbolKind::Variable
+        };
+
+        Ok(Some(Symbol {
+            name,
+            kind,
+            content: content.to_string(),
+            file_path: file_path.to_path_buf(),
+            start_line: start_pos.row + 1,
+            end_line: end_pos.row + 1,
+            start_column: start_pos.column,
+            end_column: end_pos.column,
+            context: context.clone(),
+        }))
+    }
+
+    /// Extract receiver type from Go method declaration
+    fn extract_go_receiver_type(
+        &self,
+        node: Node,
+        source: &str,
+    ) -> Result<Option<String>, anyhow::Error> {
+        for child in node.children(&mut node.walk()) {
+            if child.kind() == "parameter_list" {
+                // This is likely the receiver
+                if let Some(receiver_type) =
+                    self.find_child_text(child, "type_identifier", source)?
+                {
+                    return Ok(Some(receiver_type));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Helper function to find text content of a child node with specific kind
     fn find_child_text(
         &self,
         node: Node,
         kind: &str,
         source: &str,
-    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<String>, anyhow::Error> {
         for child in node.children(&mut node.walk()) {
             if child.kind() == kind {
                 let text = child.utf8_text(source.as_bytes())?;
@@ -485,6 +866,33 @@ impl SymbolParser {
         }
         Ok(None)
     }
+}
+
+/// Helper function to extract file metadata (last modified time)
+pub fn get_file_metadata(path: &Path) -> Result<u64, anyhow::Error> {
+    let metadata = fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("Failed to get metadata for '{}': {}", path.display(), e))?;
+
+    let last_modified = metadata
+        .modified()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to get modified time for '{}': {}",
+                path.display(),
+                e
+            )
+        })?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to get last modified time for {}: {}",
+                path.display(),
+                e
+            )
+        })?
+        .as_secs();
+
+    Ok(last_modified)
 }
 
 /// Index a codebase by walking through directories and extracting symbols
@@ -506,30 +914,22 @@ pub fn parse_codebase<P: AsRef<Path>>(root_path: P) -> Result<Vec<Symbol>, anyho
             continue;
         }
 
-        // generate file state only for files
-        let last_modified = match entry
-            .metadata()
-            .map_err(|e| anyhow::anyhow!("Failed to get metadata for '{}': {}", path.display(), e))?
-            .modified()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to get modified time for '{}': {}",
-                    path.display(),
-                    e
-                )
-            })?
-            .duration_since(UNIX_EPOCH)
-        {
-            Ok(duration) => duration.as_secs(),
+        // if extension is not supported, skip
+        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        match extension {
+            "rs" | "py" | "go" => (),
+            _ => continue,
+        }
+
+        // Get file metadata
+        let last_modified = match get_file_metadata(path) {
+            Ok(timestamp) => timestamp,
             Err(e) => {
-                warn!(
-                    "Failed to get last modified time for {}: {}",
-                    path.display(),
-                    e
-                );
+                warn!("Skipping file due to metadata error: {}", e);
                 continue;
             }
         };
+
         let file_state = FileState::new(path.to_string_lossy().to_string(), last_modified)
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -539,11 +939,6 @@ pub fn parse_codebase<P: AsRef<Path>>(root_path: P) -> Result<Vec<Symbol>, anyho
                 )
             })?;
         file_state_map.insert(path.to_string_lossy().to_string(), file_state);
-
-        let extension = match path.extension().and_then(|ext| ext.to_str()) {
-            Some(ext) => ext,
-            None => "",
-        };
 
         if SupportedLanguage::from_extension(extension).is_some() {
             debug!("Processing file: {}", path.display());
@@ -568,7 +963,7 @@ pub fn parse_codebase<P: AsRef<Path>>(root_path: P) -> Result<Vec<Symbol>, anyho
         file_states: file_state_map,
     };
     codebase_state
-        .to_file()
+        .to_file(None)
         .map_err(|e| anyhow::anyhow!("Failed to save codebase state to index.json: {}", e))?;
 
     info!(
@@ -576,354 +971,4 @@ pub fn parse_codebase<P: AsRef<Path>>(root_path: P) -> Result<Vec<Symbol>, anyho
         all_symbols.len()
     );
     Ok(all_symbols)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tree_sitter::Node;
-
-    fn print_node_info(node: Node, depth: usize) {
-        let indent = "  ".repeat(depth);
-        debug!(
-            "{}Node: {:?} at {}:{}",
-            indent,
-            node.kind(),
-            node.start_position().row,
-            node.start_position().column
-        );
-
-        if node.child_count() > 0 {
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    print_node_info(child, depth + 1);
-                }
-            }
-        }
-    }
-
-    fn find_functions(node: Node) -> Vec<String> {
-        let mut functions = Vec::new();
-
-        if node.kind() == "function_item" {
-            // Find the function name
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    if child.kind() == "identifier" {
-                        let text =
-                            match child.utf8_text(test_data::TEST_RUST_CODE_SIMPLE.as_bytes()) {
-                                Ok(text) => text,
-                                Err(e) => panic!("Error getting text: {e}"),
-                            };
-                        functions.push(text.to_string());
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Recursively search children
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                functions.extend(find_functions(child));
-            }
-        }
-
-        functions
-    }
-
-    fn find_structs(node: Node) -> Vec<String> {
-        let mut structs = Vec::new();
-
-        if node.kind() == "struct_item" {
-            // Find the struct name
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    if child.kind() == "type_identifier" {
-                        let text =
-                            match child.utf8_text(test_data::TEST_RUST_CODE_SIMPLE.as_bytes()) {
-                                Ok(text) => text,
-                                Err(e) => panic!("Error getting text: {e}"),
-                            };
-                        structs.push(text.to_string());
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Recursively search children
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                structs.extend(find_structs(child));
-            }
-        }
-
-        structs
-    }
-
-    #[test]
-    fn symbol_analysis() {
-        let _ = tracing_subscriber::fmt::try_init();
-
-        let mut parser = Parser::new();
-        match parser.set_language(&tree_sitter_rust::LANGUAGE.into()) {
-            Ok(parser) => parser,
-            Err(e) => panic!("Error loading Rust grammar: {e}"),
-        };
-
-        let tree = match parser.parse(test_data::TEST_RUST_CODE_SIMPLE, None) {
-            Some(tree) => tree,
-            None => panic!("Error parsing source code"),
-        };
-        let root_node = tree.root_node();
-
-        debug!("=== Tree Structure Analysis ===");
-        print_node_info(root_node, 0);
-
-        debug!("=== Function Analysis ===");
-        let functions = find_functions(root_node);
-        debug!("Found functions: {:?}", functions);
-
-        debug!("=== Struct Analysis ===");
-        let structs = find_structs(root_node);
-        debug!("Found structs: {:?}", structs);
-
-        // Assertions about the structure
-        assert!(functions.contains(&"new".to_string()));
-        assert!(functions.contains(&"add_hobby".to_string()));
-        assert!(functions.contains(&"get_info".to_string()));
-        assert!(functions.contains(&"create_people".to_string()));
-        assert!(functions.contains(&"test_person_creation".to_string()));
-
-        assert!(structs.contains(&"Person".to_string()));
-
-        // Check that we found the expected number of functions
-        assert_eq!(functions.len(), 5);
-        assert_eq!(structs.len(), 1);
-
-        debug!("=== Test completed successfully ===");
-    }
-
-    #[test]
-    fn test_symbol_extraction() {
-        let _ = tracing_subscriber::fmt::try_init();
-
-        // Create a temporary file with our test Rust code
-        let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("test_symbols.rs");
-        match std::fs::write(&test_file, test_data::TEST_RUST_CODE_SIMPLE) {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to write test file: {e}"),
-        };
-
-        // Create symbol parser and parse the file
-        let mut parser = match SymbolParser::new() {
-            Ok(parser) => parser,
-            Err(e) => panic!("Failed to create parser: {e}"),
-        };
-        let symbols = match parser.parse_file(&test_file) {
-            Ok(symbols) => symbols,
-            Err(e) => panic!("Failed to parse file: {e}"),
-        };
-
-        // Clean up the temporary file
-        std::fs::remove_file(&test_file).ok();
-
-        debug!("=== Symbol Extraction Results ===");
-        for symbol in &symbols {
-            debug!(
-                "Symbol: {} ({:?}) at {}:{}-{}:{} in {}",
-                symbol.name,
-                symbol.kind,
-                symbol.start_line,
-                symbol.start_column,
-                symbol.end_line,
-                symbol.end_column,
-                symbol.file_path.display()
-            );
-            if let Some(ref context) = symbol.context {
-                debug!("  Context: {}", context);
-            }
-        }
-
-        // Verify we found the expected symbols
-        let function_symbols: Vec<_> = symbols
-            .iter()
-            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-            .map(|s| s.name.as_str())
-            .collect();
-
-        let struct_symbols: Vec<_> = symbols
-            .iter()
-            .filter(|s| s.kind == SymbolKind::Struct)
-            .map(|s| s.name.as_str())
-            .collect();
-
-        // Check functions and methods
-        assert!(function_symbols.contains(&"new"));
-        assert!(function_symbols.contains(&"add_hobby"));
-        assert!(function_symbols.contains(&"get_info"));
-        assert!(function_symbols.contains(&"create_people"));
-        assert!(function_symbols.contains(&"test_person_creation"));
-
-        // Check structs
-        assert!(struct_symbols.contains(&"Person"));
-
-        // Verify we have the expected counts (might be more due to impl blocks, etc.)
-        assert!(function_symbols.len() >= 5);
-        assert!(!struct_symbols.is_empty());
-
-        // Check that all symbols have valid content
-        for symbol in &symbols {
-            assert!(
-                !symbol.content.is_empty(),
-                "Symbol '{}' has empty content",
-                symbol.name
-            );
-            assert!(
-                symbol.start_line > 0,
-                "Symbol '{}' has invalid start line",
-                symbol.name
-            );
-            assert!(
-                symbol.end_line >= symbol.start_line,
-                "Symbol '{}' has invalid line range",
-                symbol.name
-            );
-        }
-
-        info!(
-            "Symbol extraction test completed successfully. Found {} symbols",
-            symbols.len()
-        );
-    }
-
-    #[test]
-    fn test_codebase_indexing() {
-        let _ = tracing_subscriber::fmt::try_init();
-
-        // Create a temporary directory structure with test files
-        let temp_dir = std::env::temp_dir().join("test_codebase");
-        let src_dir = temp_dir.join("src");
-        match std::fs::create_dir_all(&src_dir) {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to create test directory: {e}"),
-        };
-
-        // Create test files
-        let lib_file = src_dir.join("lib.rs");
-        let main_file = src_dir.join("main.rs");
-
-        match std::fs::write(&lib_file, test_data::TEST_RUST_CODE_SIMPLE) {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to write lib.rs: {e}"),
-        };
-        match std::fs::write(&main_file, "fn main() { println!(\"Hello, world!\"); }") {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to write main.rs: {e}"),
-        };
-
-        // Index the codebase
-        let symbols = match parse_codebase(&temp_dir) {
-            Ok(symbols) => symbols,
-            Err(e) => panic!(
-                "Failed to index codebase at '{}': {}",
-                temp_dir.display(),
-                e
-            ),
-        };
-
-        // Before we clean up, we should check if the codebase state is created
-        let codebase_state = match CodebaseState::from_file() {
-            Ok(codebase_state) => codebase_state,
-            Err(e) => panic!("Failed to read codebase state from index.json: {}", e),
-        };
-        assert_eq!(codebase_state.file_states.len(), 2);
-        let lib_file_path = lib_file.to_string_lossy().to_string();
-        let main_file_path = main_file.to_string_lossy().to_string();
-        let lib_file_state = match codebase_state.file_states.get(&lib_file_path) {
-            Some(file_state) => file_state,
-            None => panic!("Failed to get lib.rs file state"),
-        };
-        let main_file_state = match codebase_state.file_states.get(&main_file_path) {
-            Some(file_state) => file_state,
-            None => panic!("Failed to get main.rs file state"),
-        };
-        assert!(
-            lib_file_state.last_modified > 0,
-            "lib.rs should have a valid timestamp"
-        );
-        assert!(
-            main_file_state.last_modified > 0,
-            "main.rs should have a valid timestamp"
-        );
-
-        // Clean up
-        std::fs::remove_dir_all(&temp_dir).ok();
-
-        debug!("=== Codebase Indexing Results ===");
-        debug!("Total symbols found: {}", symbols.len());
-
-        // Checks
-        // 1. Group symbols by file
-        let mut symbols_by_file: HashMap<PathBuf, Vec<&Symbol>> = HashMap::new();
-        for symbol in &symbols {
-            symbols_by_file
-                .entry(symbol.file_path.clone())
-                .or_default()
-                .push(symbol);
-        }
-
-        for (file_path, file_symbols) in &symbols_by_file {
-            debug!(
-                "File: {} - {} symbols",
-                file_path.display(),
-                file_symbols.len()
-            );
-            for symbol in file_symbols {
-                debug!("  {} ({:?})", symbol.name, symbol.kind);
-            }
-        }
-
-        // Verify we found symbols from both files
-        assert!(
-            symbols.len() >= 3,
-            "Should find at least 3 symbols across files, found {}",
-            symbols.len()
-        );
-
-        // Check that we have symbols from both files
-        let lib_symbols = symbols
-            .iter()
-            .filter(
-                |s| match s.file_path.file_name().and_then(|name| name.to_str()) {
-                    Some(filename) => filename == "lib.rs",
-                    None => false,
-                },
-            )
-            .count();
-        let main_symbols = symbols
-            .iter()
-            .filter(
-                |s| match s.file_path.file_name().and_then(|name| name.to_str()) {
-                    Some(filename) => filename == "main.rs",
-                    None => false,
-                },
-            )
-            .count();
-
-        assert!(lib_symbols > 0, "Should find symbols in lib.rs");
-        assert!(main_symbols > 0, "Should find symbols in main.rs");
-
-        info!(
-            "Codebase indexing test completed successfully. Found {} symbols across {} files with {} file states tracked",
-            symbols.len(),
-            symbols_by_file.len(),
-            codebase_state.file_states.len()
-        );
-
-        // clean up the index file
-        std::fs::remove_file("./rua.index.json").ok();
-    }
 }

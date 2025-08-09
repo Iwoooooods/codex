@@ -311,14 +311,14 @@ impl HierarchicalChunker {
     fn create_chunk_from_symbol(&self, symbol: &Symbol, depth: usize, is_split: bool) -> CodeChunk {
         let content = if self.options.include_metadata {
             format!(
-                "// File: {}, Symbol: {}, Kind: {:?}\n{}\n, Content: {}\n",
+                "// File: {}, Symbol: {}, Kind: {:?} {}, Content: {}",
                 symbol.file_path.display(),
                 symbol.name,
                 symbol.kind,
                 symbol
                     .context
                     .as_ref()
-                    .map(|ctx| format!("// Context: {ctx}"))
+                    .map(|ctx| format!(", Context: {ctx}"))
                     .unwrap_or_default(),
                 symbol.content
             )
@@ -344,40 +344,8 @@ impl HierarchicalChunker {
     }
 }
 
-/// Simple chunking strategy that creates one chunk per symbol
-pub fn create_simple_chunks_from_symbols(symbols: &[Symbol]) -> Vec<CodeChunk> {
-    symbols
-        .iter()
-        .map(|symbol| {
-            let content = format!(
-                "// File: {}, Symbol: {}, Kind: {:?}\n\n{}",
-                symbol.file_path.display(),
-                symbol.name,
-                symbol.kind,
-                symbol.content
-            );
-
-            CodeChunk {
-                content,
-                file_path: symbol.file_path.clone(),
-                start_line: symbol.start_line,
-                end_line: symbol.end_line,
-                symbol_name: symbol.name.clone(),
-                symbol_kind: format!("{:?}", symbol.kind),
-                context: symbol.context.clone(),
-                chunk_metadata: ChunkMetadata {
-                    is_split: false,
-                    original_size_lines: symbol.end_line - symbol.start_line + 1,
-                    chunk_depth: 0,
-                    is_container: false,
-                },
-            }
-        })
-        .collect()
-}
-
 /// Index a codebase and create chunks ready for embedding using hierarchical strategy
-pub async fn index_codebase<P: AsRef<std::path::Path>>(
+pub async fn chunk_codebase<P: AsRef<std::path::Path>>(
     root_path: P,
     chunking_options: ChunkingOptions,
 ) -> Result<Vec<crate::embedding::EmbeddedChunk>, anyhow::Error> {
@@ -388,9 +356,22 @@ pub async fn index_codebase<P: AsRef<std::path::Path>>(
     let mut chunker = HierarchicalChunker::new(chunking_options)?;
     let chunks = chunker.chunk_symbols(&symbols)?;
 
-    // 3. Embed chunks
-    let config = crate::embedding::EmbeddingConfig::default();
-    let client = crate::embedding::EmbeddingClient::new(config)?;
-    let embedded_chunks = client.embed_chunks(&chunks).await?;
+    // 3. Embed chunks using global embedding client
+    let embedding_client = crate::embedding::get_embedding_client()?;
+    let embedded_chunks = embedding_client.embed_chunks(&chunks).await?;
+    Ok(embedded_chunks)
+}
+
+pub async fn chunk_codefile<P: AsRef<std::path::Path>>(
+    file_path: P,
+    chunking_options: ChunkingOptions,
+) -> Result<Vec<crate::embedding::EmbeddedChunk>, anyhow::Error> {
+    let mut parser = SymbolParser::new()?;
+    let symbols = parser.parse_file(&file_path)?;
+    let mut chunker = HierarchicalChunker::new(chunking_options)?;
+    let chunks = chunker.chunk_symbols(&symbols)?;
+    // Use global embedding client
+    let embedding_client = crate::embedding::get_embedding_client()?;
+    let embedded_chunks = embedding_client.embed_chunks(&chunks).await?;
     Ok(embedded_chunks)
 }

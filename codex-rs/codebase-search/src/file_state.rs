@@ -9,15 +9,15 @@ pub struct CodebaseState {
 }
 
 impl CodebaseState {
-    pub fn to_file(&self) -> Result<(), anyhow::Error> {
-        let file_path = "./rua.index.json";
+    pub fn to_file(&self, file_path: Option<&str>) -> Result<(), anyhow::Error> {
+        let file_path = file_path.unwrap_or("./.rua.index.json");
         let file_content = serde_json::to_string_pretty(self)?;
         std::fs::write(file_path, file_content)?;
         Ok(())
     }
 
-    pub fn from_file() -> Result<Self, anyhow::Error> {
-        let file_path = "./rua.index.json";
+    pub fn from_file(file_path: Option<&str>) -> Result<Self, anyhow::Error> {
+        let file_path = file_path.unwrap_or("./.rua.index.json");
         let file_content = std::fs::read_to_string(file_path)?;
         let codebase_state: CodebaseState = serde_json::from_str(&file_content)?;
         Ok(codebase_state)
