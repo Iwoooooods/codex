@@ -293,8 +293,9 @@ impl EmbeddingClient {
             let error_text = response.text().await.unwrap_or_default();
             error!("Embedding API error: {}", error_text);
             return Err(anyhow!(
-                "Embedding API request failed with status: {}",
-                status
+                "Embedding API request failed with status: {}, with payload: {:?}",
+                status,
+                request.input,
             ));
         }
 

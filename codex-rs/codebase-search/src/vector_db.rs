@@ -1,3 +1,5 @@
+use crate::walk_utils::is_supported_file_extension;
+use crate::walk_utils::walk_codebase_files;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
@@ -7,7 +9,6 @@ use std::sync::LazyLock;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
-use walkdir::WalkDir;
 
 use serde_json::json;
 
@@ -46,7 +47,7 @@ fn generate_point_id(
     hasher.update(end_line.to_string().as_bytes());
     hasher.update(symbol_name.as_bytes());
     let hash = hasher.finalize();
-    
+
     // Format as a UUID-like string that Qdrant will accept
     // Take first 32 hex chars and format as UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
     let hex_str = format!("{hash:x}");
@@ -60,14 +61,6 @@ fn generate_point_id(
     )
 }
 
-pub(crate) static COLLECTION_ID: LazyLock<Arc<String>> = LazyLock::new(|| {
-    let current_dir = match std::env::current_dir() {
-        Ok(dir) => dir,
-        Err(e) => panic!("Failed to get current directory: {e}"),
-    };
-    Arc::new(generate_collection_id(&current_dir))
-});
-
 pub(crate) static QDRANT_CLIENT: LazyLock<Arc<Qdrant>> =
     LazyLock::new(|| match Qdrant::from_url("http://localhost:6334").build() {
         Ok(client) => Arc::new(client),
@@ -77,17 +70,28 @@ pub(crate) static QDRANT_CLIENT: LazyLock<Arc<Qdrant>> =
 /// Generate a unique collection ID from a root path using SHA-256 hashing
 /// This creates a deterministic, unique identifier that's safe for use as a collection name
 /// The collection ID will be the same for the same root path across different sessions
-fn generate_collection_id<P: AsRef<Path>>(root_path: P) -> String {
+pub(crate) fn generate_collection_id<P: AsRef<Path>>(root_path: P) -> String {
     let mut hasher = Sha256::new();
-    
+
     hasher.update(root_path.as_ref().to_string_lossy().as_bytes());
-    
+
     let hash = hasher.finalize();
     let hash_str = format!("{hash:x}");
 
     // Take the first 16 characters of the hash to keep it reasonably short
     // while still maintaining uniqueness
-    format!("codex_{}", &hash_str[..16])
+    format!("rua_{}", &hash_str[..16])
+}
+
+/// Helper function to clean up a collection when operations fail
+/// This is used by both init_session and restore_session
+async fn cleanup_collection(collection_id: &str, reason: &str) {
+    warn!("Cleaning up collection {collection_id} due to error: {reason}");
+    if let Err(cleanup_err) = QDRANT_CLIENT.delete_collection(collection_id).await {
+        warn!("Failed to cleanup collection {collection_id} after error: {cleanup_err}");
+    } else {
+        info!("Successfully cleaned up collection {collection_id}");
+    }
 }
 
 // New helper to collect supported file states under a root path
@@ -95,23 +99,16 @@ fn collect_supported_file_states<P: AsRef<Path>>(
     root_path: P,
 ) -> Result<HashMap<String, FileState>, anyhow::Error> {
     let mut file_states = HashMap::new();
+    let root_path = root_path.as_ref();
 
-    for entry in WalkDir::new(root_path.as_ref()).follow_links(false) {
-        let entry = entry.map_err(|e| anyhow::anyhow!("Failed to walk directory: {}", e))?;
-        let path = entry.path();
-
-        if !path.is_file() {
-            continue;
-        }
-
+    walk_codebase_files(root_path, |path| {
         // Only process supported file types
-        match path.extension().and_then(|ext| ext.to_str()) {
-            Some("rs" | "py" | "go") => (),
-            _ => continue,
+        if !is_supported_file_extension(path) {
+            return Ok(true); // Continue walking
         }
 
         let file_path_str = path
-            .strip_prefix(root_path.as_ref())
+            .strip_prefix(root_path)
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
@@ -121,7 +118,7 @@ fn collect_supported_file_states<P: AsRef<Path>>(
             Ok(timestamp) => timestamp,
             Err(e) => {
                 warn!("Skipping file due to metadata error: {}", e);
-                continue;
+                return Ok(true); // Continue walking
             }
         };
 
@@ -135,7 +132,8 @@ fn collect_supported_file_states<P: AsRef<Path>>(
             })?;
 
         file_states.insert(file_path_str, file_state);
-    }
+        Ok(true) // Continue walking
+    })?;
 
     Ok(file_states)
 }
@@ -155,19 +153,63 @@ fn collect_supported_file_states<P: AsRef<Path>>(
 ///     }
 /// }
 pub async fn init_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow::Error> {
-    // create a new collection
+    let collection_id = generate_collection_id(root_path.as_ref());
+
+    // Check if collection already exists and delete it if it does
+    // This handles the case where a previous init failed partway through
+    match QDRANT_CLIENT.collection_info(&collection_id.clone()).await {
+        Ok(_) => {
+            warn!(
+                "Collection {} already exists, deleting it before recreating",
+                collection_id
+            );
+            QDRANT_CLIENT
+                .delete_collection(&collection_id)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to delete existing collection {}: {}",
+                        collection_id,
+                        e
+                    )
+                })?;
+        }
+        Err(_) => {
+            // Collection doesn't exist, which is expected for a new init
+            debug!(
+                "Collection {} doesn't exist, proceeding with creation",
+                collection_id
+            );
+        }
+    }
+
+    // Create a new collection
     QDRANT_CLIENT
         .create_collection(
-            CreateCollectionBuilder::new(COLLECTION_ID.clone().as_str()).vectors_config(
+            CreateCollectionBuilder::new(collection_id.clone()).vectors_config(
                 VectorParamsBuilder::new(QDRANT_EMBEDDING_DIMENSION as u64, Distance::Cosine),
             ),
         )
-        .await?;
-    info!("Created collection: {}", COLLECTION_ID.clone().as_str());
-    // index the project
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create collection {}: {}", collection_id, e))?;
+
+    info!("Created collection: {}", collection_id);
+
+    // From this point on, if anything fails, we need to clean up the collection
+    let collection_id_for_cleanup = collection_id.clone();
+
+    // Index the project
     let opts = ChunkingOptions::default();
-    let chunks = chunk_codebase(root_path.as_ref(), opts).await?;
-    // chunks to points with metadata
+    let chunks = match chunk_codebase(root_path.as_ref(), opts).await {
+        Ok(chunks) => chunks,
+        Err(e) => {
+            let error_msg = format!("Failed to chunk codebase: {e}");
+            cleanup_collection(&collection_id_for_cleanup, &error_msg).await;
+            return Err(anyhow::anyhow!(error_msg));
+        }
+    };
+
+    // Convert chunks to points with metadata
     let points = chunks
         .into_iter()
         .map(|chunk| {
@@ -193,7 +235,9 @@ pub async fn init_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow::Er
                 "content": chunk.chunk.content.clone(),
             })) {
                 Ok(payload) => payload,
-                Err(e) => panic!("Failed to convert chunk to payload: {e}"),
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to convert chunk to payload: {}", e));
+                }
             };
 
             let point_id = generate_point_id(
@@ -203,25 +247,56 @@ pub async fn init_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow::Er
                 &chunk.chunk.symbol_name,
             );
 
-            PointStruct::new(point_id, chunk.embedding, payload)
+            Ok(PointStruct::new(point_id, chunk.embedding, payload))
         })
-        .collect::<Vec<_>>();
-    // save the chunks to the vector db
-    QDRANT_CLIENT
-        .upsert_points(UpsertPointsBuilder::new(
-            COLLECTION_ID.clone().as_str(),
-            points,
-        ))
-        .await?;
-    // save the state file
-    std::env::set_current_dir(root_path.as_ref())?;
+        .collect::<Result<Vec<_>, anyhow::Error>>();
 
-    // Use the shared helper to build file states
-    let file_states = collect_supported_file_states(root_path.as_ref())?;
+    let points = match points {
+        Ok(points) => points,
+        Err(e) => {
+            cleanup_collection(&collection_id_for_cleanup, &e.to_string()).await;
+            return Err(e);
+        }
+    };
+
+    // Save the chunks to the vector db
+    if let Err(e) = QDRANT_CLIENT
+        .upsert_points(UpsertPointsBuilder::new(collection_id.clone(), points))
+        .await
+    {
+        let error_msg = format!("Failed to upsert points to collection {collection_id}: {e}");
+        cleanup_collection(&collection_id_for_cleanup, &error_msg).await;
+        return Err(anyhow::anyhow!(error_msg));
+    }
+
+    // Save the state file - this should be done before changing directory
+    let file_states = match collect_supported_file_states(root_path.as_ref()) {
+        Ok(states) => states,
+        Err(e) => {
+            let error_msg = format!("Failed to collect file states: {e}");
+            cleanup_collection(&collection_id_for_cleanup, &error_msg).await;
+            return Err(anyhow::anyhow!(error_msg));
+        }
+    };
+
+    // Change to the target directory
+    if let Err(e) = std::env::set_current_dir(root_path.as_ref()) {
+        let error_msg = format!(
+            "Failed to change directory to {}: {e}",
+            root_path.as_ref().display()
+        );
+        cleanup_collection(&collection_id_for_cleanup, &error_msg).await;
+        return Err(anyhow::anyhow!(error_msg));
+    }
 
     let state = CodebaseState { file_states };
-    state.to_file(None)?; // TODO: add configurable state file path
+    if let Err(e) = state.to_file(None) {
+        let error_msg = format!("Failed to save state file: {e}");
+        cleanup_collection(&collection_id_for_cleanup, &error_msg).await;
+        return Err(anyhow::anyhow!(error_msg));
+    }
 
+    info!("Successfully initialized session with collection: {collection_id}");
     Ok(())
 }
 
@@ -256,13 +331,13 @@ pub async fn restore_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow:
                     Some(saved_state) => {
                         // File existed before, check if modified
                         if current_state.content_md5 != saved_state.content_md5 {
-                            debug!("File modified: {}", file_path);
+                            debug!("File modified: {file_path}");
                             modified_files.push(file_path.clone());
                         }
                     }
                     None => {
                         // New file
-                        debug!("File added: {}", file_path);
+                        debug!("File added: {file_path}");
                         added_files.push(file_path.clone());
                     }
                 }
@@ -271,7 +346,7 @@ pub async fn restore_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow:
             // Find deleted files
             for file_path in saved_state.file_states.keys() {
                 if !seen_files.contains(file_path) {
-                    debug!("File deleted: {}", file_path);
+                    debug!("File deleted: {file_path}");
                     deleted_files.push(file_path.clone());
                 }
             }
@@ -282,7 +357,10 @@ pub async fn restore_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow:
                 modified_files.len(),
                 deleted_files.len()
             );
-            info!("Using collection: {}", COLLECTION_ID.clone().as_str());
+            info!(
+                "Using collection: {}",
+                generate_collection_id(root_path.as_ref()).as_str()
+            );
 
             // 4. Update vector database if there are changes
             if !added_files.is_empty() || !modified_files.is_empty() || !deleted_files.is_empty() {
@@ -294,8 +372,12 @@ pub async fn restore_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow:
                     .collect();
 
                 if !files_to_delete.is_empty() {
-                    debug!("Removing points for {} files (deleted: {}, modified: {})", 
-                           files_to_delete.len(), deleted_files.len(), modified_files.len());
+                    debug!(
+                        "Removing points for {} files (deleted: {}, modified: {})",
+                        files_to_delete.len(),
+                        deleted_files.len(),
+                        modified_files.len()
+                    );
 
                     // Create filter to match points with any of the file paths to delete
                     let conditions: Vec<Condition> = files_to_delete
@@ -308,7 +390,10 @@ pub async fn restore_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow:
                     // Delete all points matching this filter in a single operation
                     QDRANT_CLIENT
                         .delete_points(
-                            DeletePointsBuilder::new(COLLECTION_ID.clone().as_str()).points(filter),
+                            DeletePointsBuilder::new(
+                                generate_collection_id(root_path.as_ref()).as_str(),
+                            )
+                            .points(filter),
                         )
                         .await
                         .map_err(|e| {
@@ -318,8 +403,12 @@ pub async fn restore_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow:
                                 e
                             )
                         })?;
-                    info!("Deleted points for {} files (deleted: {}, modified: {})", 
-                          files_to_delete.len(), deleted_files.len(), modified_files.len());
+                    info!(
+                        "Deleted points for {} files (deleted: {}, modified: {})",
+                        files_to_delete.len(),
+                        deleted_files.len(),
+                        modified_files.len()
+                    );
                 }
 
                 // Process added and modified files - chunk and insert new content
@@ -330,8 +419,12 @@ pub async fn restore_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow:
                     .collect();
 
                 if !files_to_process.is_empty() {
-                    info!("Processing {} files for insertion (added: {}, modified: {})", 
-                           files_to_process.len(), added_files.len(), modified_files.len());
+                    info!(
+                        "Processing {} files for insertion (added: {}, modified: {})",
+                        files_to_process.len(),
+                        added_files.len(),
+                        modified_files.len()
+                    );
 
                     let opts = ChunkingOptions::default();
                     let mut all_chunks = Vec::new();
@@ -339,7 +432,7 @@ pub async fn restore_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow:
                     // Process each file individually
                     for file_path in &files_to_process {
                         let full_file_path = root_path.as_ref().join(file_path);
-                        
+
                         match chunk_codefile(&full_file_path, opts.clone()).await {
                             Ok(mut chunks) => {
                                 debug!("Generated {} chunks for file: {}", chunks.len(), file_path);
@@ -352,57 +445,71 @@ pub async fn restore_session<P: AsRef<Path>>(root_path: P) -> Result<(), anyhow:
                         }
                     }
 
-                    info!("Generated {} chunks for {} files", all_chunks.len(), files_to_process.len());
+                    info!(
+                        "Generated {} chunks for {} files",
+                        all_chunks.len(),
+                        files_to_process.len()
+                    );
 
                     if !all_chunks.is_empty() {
                         // Convert chunks to points with metadata
-                        let points = all_chunks
-                            .into_iter()
-                            .map(|chunk| {
-                                let file_path_relative = chunk.chunk.file_path
-                                    .strip_prefix(root_path.as_ref())
-                                    .unwrap_or(&chunk.chunk.file_path)
-                                    .to_string_lossy()
-                                    .to_string();
+                        let mut points = Vec::new();
+                        for chunk in all_chunks {
+                            let file_path_relative = chunk
+                                .chunk
+                                .file_path
+                                .strip_prefix(root_path.as_ref())
+                                .unwrap_or(&chunk.chunk.file_path)
+                                .to_string_lossy()
+                                .to_string();
 
-                                let payload = match Payload::try_from(json!({
-                                    "file_path": file_path_relative.clone(),
-                                    "start_line": chunk.chunk.start_line,
-                                    "end_line": chunk.chunk.end_line,
-                                    "symbol_name": chunk.chunk.symbol_name.clone(),
-                                    "symbol_kind": chunk.chunk.symbol_kind.clone(),
-                                    "is_container": chunk.chunk.chunk_metadata.is_container,
-                                    "original_size_lines": chunk.chunk.chunk_metadata.original_size_lines,
-                                    "is_split": chunk.chunk.chunk_metadata.is_split,
-                                    "chunk_depth": chunk.chunk.chunk_metadata.chunk_depth,
-                                    "context": chunk.chunk.context.clone(),
-                                    "content": chunk.chunk.content.clone(),
-                                })) {
-                                    Ok(payload) => payload,
-                                    Err(e) => panic!("Failed to convert chunk to payload: {e}"),
-                                };
-                                
-                                let point_id = generate_point_id(
-                                    &file_path_relative,
-                                    chunk.chunk.start_line,
-                                    chunk.chunk.end_line,
-                                    &chunk.chunk.symbol_name
-                                );
-                                
-                                PointStruct::new(point_id, chunk.embedding, payload)
-                            })
-                            .collect::<Vec<_>>();
+                            let payload = match Payload::try_from(json!({
+                                "file_path": file_path_relative.clone(),
+                                "start_line": chunk.chunk.start_line,
+                                "end_line": chunk.chunk.end_line,
+                                "symbol_name": chunk.chunk.symbol_name.clone(),
+                                "symbol_kind": chunk.chunk.symbol_kind.clone(),
+                                "is_container": chunk.chunk.chunk_metadata.is_container,
+                                "original_size_lines": chunk.chunk.chunk_metadata.original_size_lines,
+                                "is_split": chunk.chunk.chunk_metadata.is_split,
+                                "chunk_depth": chunk.chunk.chunk_metadata.chunk_depth,
+                                "context": chunk.chunk.context.clone(),
+                                "content": chunk.chunk.content.clone(),
+                            })) {
+                                Ok(payload) => payload,
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to convert chunk to payload for file {}: {}",
+                                        file_path_relative, e
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let point_id = generate_point_id(
+                                &file_path_relative,
+                                chunk.chunk.start_line,
+                                chunk.chunk.end_line,
+                                &chunk.chunk.symbol_name,
+                            );
+
+                            points.push(PointStruct::new(point_id, chunk.embedding, payload));
+                        }
 
                         // Upsert points (this will automatically update existing points with same ID)
                         QDRANT_CLIENT
                             .upsert_points(UpsertPointsBuilder::new(
-                                COLLECTION_ID.clone().as_str(),
+                                generate_collection_id(root_path.as_ref()).as_str(),
                                 points,
                             ))
                             .await?;
 
-                        info!("Successfully inserted points for {} files (added: {}, modified: {})", 
-                               files_to_process.len(), added_files.len(), modified_files.len());
+                        info!(
+                            "Successfully inserted points for {} files (added: {}, modified: {})",
+                            files_to_process.len(),
+                            added_files.len(),
+                            modified_files.len()
+                        );
                     }
                 }
 

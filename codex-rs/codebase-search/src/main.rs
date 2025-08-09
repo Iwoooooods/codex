@@ -342,11 +342,16 @@ async fn index_codebase_command(directory: PathBuf) -> Result<()> {
 
 async fn search_codebase_command(
     query: String,
-    _directory: PathBuf,
+    directory: PathBuf,
     limit: usize,
     min_score: f32,
 ) -> Result<()> {
     use codebase_search::retriever::search_codebase;
+
+    // Canonicalize the directory path to convert relative paths to absolute paths
+    let canonical_directory = directory
+        .canonicalize()
+        .unwrap_or_else(|_| directory.clone());
 
     info!("Searching indexed codebase for query: {}", query);
 
@@ -354,7 +359,7 @@ async fn search_codebase_command(
     println!("🎯 Limit: {limit}, Min score: {min_score:.2}");
     println!();
 
-    match search_codebase(query, limit, min_score).await {
+    match search_codebase(query, &canonical_directory, limit, min_score).await {
         Ok(results) => {
             if results.is_empty() {
                 println!("❌ No results found matching your query.");

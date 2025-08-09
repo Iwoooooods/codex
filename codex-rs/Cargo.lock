@@ -645,6 +645,7 @@ dependencies = [
  "chrono",
  "clap",
  "crypto",
+ "ignore",
  "md5",
  "qdrant-client",
  "reqwest 0.11.27",

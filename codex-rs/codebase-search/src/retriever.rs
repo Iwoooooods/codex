@@ -5,8 +5,9 @@ use tracing::info;
 
 use crate::chunker::ChunkMetadata;
 use crate::chunker::CodeChunk;
-use crate::vector_db::COLLECTION_ID;
 use crate::vector_db::QDRANT_CLIENT;
+use crate::vector_db::generate_collection_id;
+use std::path::Path;
 use std::path::PathBuf;
 
 /// A search result containing the code chunk and its similarity score
@@ -17,12 +18,14 @@ pub struct SearchResult {
 }
 
 /// Search codebase with a query and return structured results
-pub async fn search_codebase(
+pub async fn search_codebase<P: AsRef<Path>>(
     query: String,
+    root_path: P,
     limit: usize,
     min_score: f32,
 ) -> Result<Vec<SearchResult>, anyhow::Error> {
-    info!("Searching collection: {}", COLLECTION_ID.clone().as_str());
+    let collection_id = generate_collection_id(root_path.as_ref());
+    info!("Searching collection: {}", collection_id);
 
     // Embed the query text using global embedding client
     let embedding_client = crate::embedding::get_embedding_client()?;
@@ -37,7 +40,7 @@ pub async fn search_codebase(
     let search_response = QDRANT_CLIENT
         .clone()
         .search_points(
-            SearchPointsBuilder::new(COLLECTION_ID.clone().as_str(), query_vector, limit as u64)
+            SearchPointsBuilder::new(collection_id.as_str(), query_vector, limit as u64)
                 .with_payload(true)
                 .params(SearchParamsBuilder::default()),
         )

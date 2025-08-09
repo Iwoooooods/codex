@@ -12,8 +12,9 @@ use tracing::warn;
 use tree_sitter::Node;
 use tree_sitter::Parser;
 
+use crate::walk_utils::is_supported_file_extension;
+use crate::walk_utils::walk_codebase_files;
 use tree_sitter::Tree;
-use walkdir::WalkDir;
 
 use crate::file_state::CodebaseState;
 use crate::file_state::FileState;
@@ -906,19 +907,10 @@ pub fn parse_codebase<P: AsRef<Path>>(root_path: P) -> Result<Vec<Symbol>, anyho
         root_path.as_ref().display()
     );
 
-    for entry in WalkDir::new(root_path).follow_links(false) {
-        let entry = entry.map_err(|e| anyhow::anyhow!("Failed to walk directory: {}", e))?;
-        let path = entry.path();
-
-        if !path.is_file() {
-            continue;
-        }
-
-        // if extension is not supported, skip
-        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-        match extension {
-            "rs" | "py" | "go" => (),
-            _ => continue,
+    walk_codebase_files(root_path.as_ref(), |path| {
+        // Only process supported file types
+        if !is_supported_file_extension(path) {
+            return Ok(true); // Continue walking
         }
 
         // Get file metadata
@@ -926,7 +918,7 @@ pub fn parse_codebase<P: AsRef<Path>>(root_path: P) -> Result<Vec<Symbol>, anyho
             Ok(timestamp) => timestamp,
             Err(e) => {
                 warn!("Skipping file due to metadata error: {}", e);
-                continue;
+                return Ok(true); // Continue walking
             }
         };
 
@@ -940,6 +932,7 @@ pub fn parse_codebase<P: AsRef<Path>>(root_path: P) -> Result<Vec<Symbol>, anyho
             })?;
         file_state_map.insert(path.to_string_lossy().to_string(), file_state);
 
+        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
         if SupportedLanguage::from_extension(extension).is_some() {
             debug!("Processing file: {}", path.display());
 
@@ -957,7 +950,8 @@ pub fn parse_codebase<P: AsRef<Path>>(root_path: P) -> Result<Vec<Symbol>, anyho
                 }
             }
         }
-    }
+        Ok(true) // Continue walking
+    })?;
 
     let codebase_state = CodebaseState {
         file_states: file_state_map,
