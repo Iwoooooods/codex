@@ -1,5 +1,4 @@
-use futures::StreamExt;
-use futures::channel::mpsc::{self, Receiver};
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -25,7 +24,7 @@ pub struct FileWatcherConfig {
     /// Debounce delay for file change events (in milliseconds)
     pub debounce_delay: u64,
     /// Whether to watch recursively
-    pub recursive: bool,
+    pub recursive: RecursiveMode,
     /// File extensions to watch (if empty, watches all files)
     pub file_extensions: Vec<String>,
     /// Directories to ignore
@@ -37,7 +36,7 @@ impl Default for FileWatcherConfig {
         Self {
             root_path: PathBuf::from("."),
             debounce_delay: 1000, // 1s debounce
-            recursive: true,
+            recursive: RecursiveMode::Recursive,
             file_extensions: vec![], // Watch all files by default
             ignore_dirs: vec![
                 ".git".to_string(),
@@ -64,15 +63,13 @@ impl FileWatcher {
 
     fn async_watcher(
         &self,
-    ) -> notify::Result<(RecommendedWatcher, Receiver<notify::Result<Event>>)> {
-        let (mut tx, rx) = mpsc::channel(1);
+    ) -> notify::Result<(RecommendedWatcher, UnboundedReceiver<notify::Result<Event>>)> {
+        let (mut tx, rx) = mpsc::unbounded_channel();
 
         let watcher = RecommendedWatcher::new(
             move |res| {
-                if let Err(e) = tx.try_send(res) {
-                    eprintln!("Failed to send file event: {}", e);
-                }
-            },
+                let _ = tx.send(res);
+            },        
             Config::default(),
         )?;
 
@@ -84,12 +81,31 @@ impl FileWatcher {
         let root_path = self.config.root_path.clone();
 
         let (mut watcher, mut rx) = self.async_watcher()?;
-        watcher.watch(&root_path, RecursiveMode::Recursive)?;
-        info!("watching for file changes under {:?}", root_path);
+        watcher.watch(&root_path, self.config.recursive)?;
+        info!("watching for file changes under {:?}...", root_path);
 
-        while let Some(res) = rx.next().await {
+        while let Some(res) = rx.recv().await {
             match res {
-                Ok(event) => return Ok(event),
+                Ok(event) => {
+                    // Filter out events for paths that should be ignored
+                    let mut filtered_paths = Vec::new();
+                    for path in &event.paths {
+                        if !Self::should_ignore_path(path, &self.config) {
+                            filtered_paths.push(path.clone());
+                        }
+                    }
+                    
+                    // Only return the event if there are paths that aren't ignored
+                    if !filtered_paths.is_empty() {
+                        let filtered_event = Event {
+                            kind: event.kind,
+                            paths: filtered_paths,
+                            attrs: event.attrs,
+                        };
+                        return Ok(filtered_event);
+                    }
+                    // If all paths were filtered out, continue waiting for the next event
+                },
                 Err(err) => return Err(err),
             }
         }
@@ -157,7 +173,7 @@ impl FileWatcherBuilder {
         self
     }
 
-    pub fn recursive(mut self, recursive: bool) -> Self {
+    pub fn recursive(mut self, recursive: RecursiveMode) -> Self {
         self.config.recursive = recursive;
         self
     }
@@ -187,46 +203,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_watcher_with_temp_directory() {
+        tracing_subscriber::fmt::init();
+        info!("starting test_file_watcher_with_temp_directory...");
         // Create a temporary directory for testing
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let temp_path = temp_dir.path();
 
         // Create a file watcher for the temp directory
-        let config = FileWatcherConfig {
-            root_path: temp_path.to_path_buf(),
-            debounce_delay: 100, // Short delay for testing
-            recursive: true,
-            file_extensions: vec![],
-            ignore_dirs: vec![],
-        };
+        let mut config = FileWatcherConfig::default();
+        config.root_path = temp_path.to_path_buf();
 
         let mut watcher = FileWatcher::new(config);
 
-        // Start watching in a separate task
-        let watch_handle = tokio::spawn(async move { watcher.watch().await });
-
         // Give the watcher a moment to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        info!("waiting for file event...");
 
         // Create a test file
         let test_file = temp_path.join("test.txt");
         fs::write(&test_file, "test content").expect("Failed to write test file");
+        // Check for file existence
+        assert!(fs::metadata(&test_file).is_ok());
 
-        // Wait for the file event with a timeout
-        match timeout(Duration::from_secs(5), watch_handle).await {
-            Ok(Ok(event)) => {
-                // Verify we got a file change event
-                match event {
-                    Ok(notify::Event { ref paths, .. }) => {
-                        // The exact event type may vary by platform, but we should get some event
-                        assert!(!paths.is_empty());
-                        println!("Received event: {:?}", event);
-                    }
-                    Err(e) => panic!("Watcher error: {:?}", e),
-                }
-            }
-            Ok(Err(e)) => panic!("Task error: {:?}", e),
-            Err(_) => panic!("Timeout waiting for file event"),
+        // build watcher with temp root
+        loop {
+          let event = tokio::time::timeout(Duration::from_secs(3), watcher.watch()).await
+              .expect("timeout")
+              .expect("watch error");
+          if event.paths.iter().any(|p| p.ends_with("test.txt")) {
+            assert!(matches!(event.kind, notify::EventKind::Create(_)));
+            break;
+          }
+          // otherwise continue to get the next event
         }
 
         // Cleanup happens automatically when TempDir is dropped
@@ -240,23 +248,13 @@ mod tests {
         // Create a watcher that ignores certain directories and only watches .txt files
         let config = FileWatcherConfig {
             root_path: temp_path.to_path_buf(),
-            debounce_delay: 100,
-            recursive: true,
+            debounce_delay: 100, // Short delay for testing
+            recursive: RecursiveMode::Recursive,
             file_extensions: vec!["txt".to_string()],
             ignore_dirs: vec!["ignored".to_string()],
         };
 
         let mut watcher = FileWatcher::new(config);
-
-        // Create ignored directory and file
-        let ignored_dir = temp_path.join("ignored");
-        fs::create_dir(&ignored_dir).expect("Failed to create ignored dir");
-        let ignored_file = ignored_dir.join("test.txt");
-        fs::write(&ignored_file, "ignored content").expect("Failed to write ignored file");
-
-        // Create watched file
-        let watched_file = temp_path.join("watched.txt");
-        fs::write(&watched_file, "watched content").expect("Failed to write watched file");
 
         // Start watching
         let watch_handle = tokio::spawn(async move { watcher.watch().await });
@@ -264,17 +262,28 @@ mod tests {
         // Give the watcher time to start
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Modify the watched file to trigger an event
-        fs::write(&watched_file, "modified content").expect("Failed to modify watched file");
+        // Create ignored directory
+        let ignored_dir = temp_path.join("ignored");
+        fs::create_dir(&ignored_dir).expect("Failed to create ignored dir");
+        
+        // Create file in ignored directory (this should be filtered out)
+        let ignored_file = ignored_dir.join("test.txt");
+        fs::write(&ignored_file, "ignored content").expect("Failed to write ignored file");
+
+        // Create watched file (this should trigger an event)
+        let watched_file = temp_path.join("watched.txt");
+        fs::write(&watched_file, "watched content").expect("Failed to write watched file");
 
         // Wait for event with timeout
-        match timeout(Duration::from_secs(5), watch_handle).await {
+        match timeout(Duration::from_secs(3), watch_handle).await {
             Ok(Ok(event)) => {
                 match event {
                     Ok(notify::Event { ref paths, .. }) => {
                         // Should only get events for the watched file, not the ignored one
                         for path in paths {
                             assert!(!path.to_string_lossy().contains("ignored"));
+                            // Should be the watched file
+                            assert!(path.to_string_lossy().contains("watched.txt"));
                         }
                         println!("Received event for watched file: {:?}", event);
                     }
