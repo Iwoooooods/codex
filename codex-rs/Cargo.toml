@@ -1,5 +1,4 @@
 [workspace]
-resolver = "2"
 members = [
     "ansi-escape",
     "apply-patch",
@@ -15,10 +14,13 @@ members = [
     "mcp-client",
     "mcp-server",
     "mcp-types",
-    "macros",
+    "ollama",
+    "protocol",
+    "protocol-ts",
     "tui",
     "codebase-search",
 ]
+resolver = "2"
 
 [workspace.package]
 version = "0.0.0"
@@ -33,6 +35,7 @@ rust = {}
 
 [workspace.lints.clippy]
 expect_used = "deny"
+uninlined_format_args = "deny"
 unwrap_used = "deny"
 
 [profile.release]
@@ -47,4 +50,3 @@ codegen-units = 1
 [patch.crates-io]
 # ratatui = { path = "../../ratatui" }
 ratatui = { git = "https://github.com/nornagon/ratatui", branch = "nornagon-v0.29.0-patch" }
-

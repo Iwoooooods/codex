@@ -3,7 +3,9 @@ use std::io;
 use std::io::Write;
 
 use crate::tui;
+use crate::wrapping::word_wrap_lines_borrowed;
 use crossterm::Command;
+use crossterm::cursor::MoveTo;
 use crossterm::queue;
 use crossterm::style::Color as CColor;
 use crossterm::style::Colors;
@@ -12,35 +14,63 @@ use crossterm::style::SetAttribute;
 use crossterm::style::SetBackgroundColor;
 use crossterm::style::SetColors;
 use crossterm::style::SetForegroundColor;
-use ratatui::layout::Position;
 use ratatui::layout::Size;
-use ratatui::prelude::Backend;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
-/// Insert `lines` above the viewport.
-pub(crate) fn insert_history_lines(terminal: &mut tui::Tui, lines: Vec<Line<'static>>) {
+/// Insert `lines` above the viewport using the terminal's backend writer
+/// (avoids direct stdout references).
+pub(crate) fn insert_history_lines(terminal: &mut tui::Terminal, lines: Vec<Line>) {
+    let mut out = std::io::stdout();
+    insert_history_lines_to_writer(terminal, &mut out, lines);
+}
+
+/// Like `insert_history_lines`, but writes ANSI to the provided writer. This
+/// is intended for testing where a capture buffer is used instead of stdout.
+pub fn insert_history_lines_to_writer<B, W>(
+    terminal: &mut crate::custom_terminal::Terminal<B>,
+    writer: &mut W,
+    lines: Vec<Line>,
+) where
+    B: ratatui::backend::Backend,
+    W: Write,
+{
     let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
 
-    let mut area = terminal.get_frame().area();
+    let mut area = terminal.viewport_area;
 
-    let wrapped_lines = wrapped_line_count(&lines, area.width);
+    // Pre-wrap lines using word-aware wrapping so terminal scrollback sees the same
+    // formatting as the TUI. This avoids character-level hard wrapping by the terminal.
+    let wrapped = word_wrap_lines_borrowed(&lines, area.width.max(1) as usize);
+    let wrapped_lines = wrapped.len() as u16;
     let cursor_top = if area.bottom() < screen_size.height {
         // If the viewport is not at the bottom of the screen, scroll it down to make room.
         // Don't scroll it past the bottom of the screen.
         let scroll_amount = wrapped_lines.min(screen_size.height - area.bottom());
-        terminal
-            .backend_mut()
-            .scroll_region_down(area.top()..screen_size.height, scroll_amount)
-            .ok();
-        let cursor_top = area.top() - 1;
+
+        // Emit ANSI to scroll the lower region (from the top of the viewport to the bottom
+        // of the screen) downward by `scroll_amount` lines. We do this by:
+        //   1) Limiting the scroll region to [area.top()+1 .. screen_height] (1-based bounds)
+        //   2) Placing the cursor at the top margin of that region
+        //   3) Emitting Reverse Index (RI, ESC M) `scroll_amount` times
+        //   4) Resetting the scroll region back to full screen
+        let top_1based = area.top() + 1; // Convert 0-based row to 1-based for DECSTBM
+        queue!(writer, SetScrollRegion(top_1based..screen_size.height)).ok();
+        queue!(writer, MoveTo(0, area.top())).ok();
+        for _ in 0..scroll_amount {
+            // Reverse Index (RI): ESC M
+            queue!(writer, Print("\x1bM")).ok();
+        }
+        queue!(writer, ResetScrollRegion).ok();
+
+        let cursor_top = area.top().saturating_sub(1);
         area.y += scroll_amount;
         terminal.set_viewport_area(area);
         cursor_top
     } else {
-        area.top() - 1
+        area.top().saturating_sub(1)
     };
 
     // Limit the scroll region to the lines from the top of the screen to the
@@ -58,42 +88,29 @@ pub(crate) fn insert_history_lines(terminal: &mut tui::Tui, lines: Vec<Line<'sta
     // ││                            ││
     // │╰────────────────────────────╯│
     // └──────────────────────────────┘
-    queue!(std::io::stdout(), SetScrollRegion(1..area.top())).ok();
+    queue!(writer, SetScrollRegion(1..area.top())).ok();
 
-    terminal
-        .set_cursor_position(Position::new(0, cursor_top))
-        .ok();
+    // NB: we are using MoveTo instead of set_cursor_position here to avoid messing with the
+    // terminal's last_known_cursor_position, which hopefully will still be accurate after we
+    // fetch/restore the cursor position. insert_history_lines should be cursor-position-neutral :)
+    queue!(writer, MoveTo(0, cursor_top)).ok();
 
-    for line in lines {
-        queue!(std::io::stdout(), Print("\r\n")).ok();
-        write_spans(&mut std::io::stdout(), line.iter()).ok();
+    for line in wrapped {
+        queue!(writer, Print("\r\n")).ok();
+        write_spans(writer, &line).ok();
     }
 
-    queue!(std::io::stdout(), ResetScrollRegion).ok();
-}
+    queue!(writer, ResetScrollRegion).ok();
 
-fn wrapped_line_count(lines: &[Line], width: u16) -> u16 {
-    let mut count = 0;
-    for line in lines {
-        count += line_height(line, width);
-    }
-    count
-}
-
-fn line_height(line: &Line, width: u16) -> u16 {
-    use unicode_width::UnicodeWidthStr;
-    // get the total display width of the line, accounting for double-width chars
-    let total_width = line
-        .spans
-        .iter()
-        .map(|span| span.content.width())
-        .sum::<usize>();
-    // divide by width to get the number of lines, rounding up
-    if width == 0 {
-        1
-    } else {
-        (total_width as u16).div_ceil(width).max(1)
-    }
+    // Restore the cursor position to where it was before we started.
+    queue!(
+        writer,
+        MoveTo(
+            terminal.last_known_cursor_pos.x,
+            terminal.last_known_cursor_pos.y
+        )
+    )
+    .ok();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,22 +222,22 @@ impl ModifierDiff {
 
 fn write_spans<'a, I>(mut writer: &mut impl Write, content: I) -> io::Result<()>
 where
-    I: Iterator<Item = &'a Span<'a>>,
+    I: IntoIterator<Item = &'a Span<'a>>,
 {
     let mut fg = Color::Reset;
     let mut bg = Color::Reset;
-    let mut modifier = Modifier::empty();
+    let mut last_modifier = Modifier::empty();
     for span in content {
-        let mut next_modifier = modifier;
-        next_modifier.insert(span.style.add_modifier);
-        next_modifier.remove(span.style.sub_modifier);
-        if next_modifier != modifier {
+        let mut modifier = Modifier::empty();
+        modifier.insert(span.style.add_modifier);
+        modifier.remove(span.style.sub_modifier);
+        if modifier != last_modifier {
             let diff = ModifierDiff {
-                from: modifier,
-                to: next_modifier,
+                from: last_modifier,
+                to: modifier,
             };
             diff.queue(&mut writer)?;
-            modifier = next_modifier;
+            last_modifier = modifier;
         }
         let next_fg = span.style.fg.unwrap_or(Color::Reset);
         let next_bg = span.style.bg.unwrap_or(Color::Reset);
@@ -242,4 +259,37 @@ where
         SetBackgroundColor(CColor::Reset),
         SetAttribute(crossterm::style::Attribute::Reset),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writes_bold_then_regular_spans() {
+        use ratatui::style::Stylize;
+
+        let spans = ["A".bold(), "B".into()];
+
+        let mut actual: Vec<u8> = Vec::new();
+        write_spans(&mut actual, spans.iter()).unwrap();
+
+        let mut expected: Vec<u8> = Vec::new();
+        queue!(
+            expected,
+            SetAttribute(crossterm::style::Attribute::Bold),
+            Print("A"),
+            SetAttribute(crossterm::style::Attribute::NormalIntensity),
+            Print("B"),
+            SetForegroundColor(CColor::Reset),
+            SetBackgroundColor(CColor::Reset),
+            SetAttribute(crossterm::style::Attribute::Reset),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(actual).unwrap(),
+            String::from_utf8(expected).unwrap()
+        );
+    }
 }
