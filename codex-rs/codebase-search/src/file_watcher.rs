@@ -64,7 +64,7 @@ impl FileWatcher {
     fn async_watcher(
         &self,
     ) -> notify::Result<(RecommendedWatcher, UnboundedReceiver<notify::Result<Event>>)> {
-        let (mut tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::unbounded_channel();
 
         let watcher = RecommendedWatcher::new(
             move |res| {

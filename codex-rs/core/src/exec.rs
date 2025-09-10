@@ -3,13 +3,10 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
-use std::collections::HashMap;
-use std::io;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::Duration;
 use std::time::Instant;
-use tracing::debug;
 
 use async_channel::Sender;
 use tokio::io::AsyncRead;

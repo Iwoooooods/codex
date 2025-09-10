@@ -166,35 +166,6 @@ pub(crate) enum JsonSchema {
     },
 }
 
-/// A property in a JSON schema that can include a description
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub(crate) enum Property {
-    WithDescription {
-        #[serde(flatten)]
-        schema: JsonSchema,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        description: Option<&'static str>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[serde(rename = "enum")]
-        enum_values: Option<&'static [&'static str]>,
-    },
-    Simple(JsonSchema),
-}
-
-/// Helper function to create an OpenAI tool from a struct that implements ToJsonSchema
-pub fn create_tool_from_struct<T>(name: &'static str, description: &'static str) -> OpenAiTool
-where
-    T: ToJsonSchema,
-{
-    OpenAiTool::Function(ResponsesApiTool {
-        name,
-        description,
-        strict: true,
-        parameters: T::to_json_schema(),
-    })
-}
-
 fn create_shell_tool() -> OpenAiTool {
     let mut properties = BTreeMap::new();
     properties.insert(

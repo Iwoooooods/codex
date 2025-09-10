@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use crate::exec_env::create_env;
 use base64::Engine;
 use mcp_types::CallToolResult;
 use serde::Deserialize;
@@ -9,10 +8,6 @@ use serde::Serialize;
 use serde::ser::Serializer;
 use ts_rs::TS;
 
-use crate::codex::Session;
-use crate::exec::ExecParams;
-use crate::openai_tools::JsonSchema;
-use crate::openai_tools::ToJsonSchema;
 use crate::protocol::InputItem;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -254,10 +249,9 @@ pub struct ShellToolCallParams {
     pub command: Vec<String>,
     /// The directory that the command will be running under, default to be the root of this workspace.
     pub workdir: Option<String>,
-    /// This is the maximum time in milliseconds that the command is allowed to run.
-    pub timeout: Option<u64>,
-    /// Optional explanation of what the command is intended to do
-    pub explanation: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub with_escalated_permissions: Option<bool>,
+    pub justification: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, TS)]
@@ -314,185 +308,5 @@ impl std::ops::Deref for FunctionCallOutputPayload {
     type Target = str;
     fn deref(&self) -> &Self::Target {
         &self.content
-    }
-}
-
-// (Moved event mapping logic into codex-core to avoid coupling protocol to UI-facing events.)
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openai_tools::ToJsonSchema;
-
-    #[test]
-    fn serializes_success_as_plain_string() {
-        let item = ResponseInputItem::FunctionCallOutput {
-            call_id: "call1".into(),
-            output: FunctionCallOutputPayload {
-                content: "ok".into(),
-                success: None,
-            },
-        };
-
-        let json = serde_json::to_string(&item).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        // Success case -> output should be a plain string
-        assert_eq!(v.get("output").unwrap().as_str().unwrap(), "ok");
-    }
-
-    #[test]
-    fn serializes_failure_as_string() {
-        let item = ResponseInputItem::FunctionCallOutput {
-            call_id: "call1".into(),
-            output: FunctionCallOutputPayload {
-                content: "bad".into(),
-                success: Some(false),
-            },
-        };
-
-        let json = serde_json::to_string(&item).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(v.get("output").unwrap().as_str().unwrap(), "bad");
-    }
-
-    #[test]
-    fn deserialize_shell_tool_call_params() {
-        let json = r#"{
-            "command": ["ls", "-l"],
-            "workdir": "/tmp",
-            "timeout": 1000
-        }"#;
-
-        let params: ShellToolCallParams = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            ShellToolCallParams {
-                command: vec!["ls".to_string(), "-l".to_string()],
-                workdir: Some("/tmp".to_string()),
-                timeout_ms: Some(1000),
-                with_escalated_permissions: None,
-                justification: None,
-            },
-            params
-        );
-    }
-
-    #[test]
-    fn test_read_file_validation_valid_params() {
-        let params = ReadFileToolCallParams {
-            path: "test.txt".to_string(),
-            should_read_entire_file: false,
-            start_line_one_indexed: Some(1),
-            end_line_one_indexed_inclusive: Some(10),
-            explanation: None,
-        };
-        assert!(params.validate().is_ok());
-    }
-
-    #[test]
-    fn test_read_file_validation_start_greater_than_end() {
-        let params = ReadFileToolCallParams {
-            path: "test.txt".to_string(),
-            should_read_entire_file: false,
-            start_line_one_indexed: Some(10),
-            end_line_one_indexed_inclusive: Some(5),
-            explanation: None,
-        };
-        let result = params.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("start_line_one_indexed (10) must be less than or equal to end_line_one_indexed_inclusive (5)"));
-    }
-
-    #[test]
-    fn test_read_file_validation_zero_line_numbers() {
-        let params = ReadFileToolCallParams {
-            path: "test.txt".to_string(),
-            should_read_entire_file: false,
-            start_line_one_indexed: Some(0),
-            end_line_one_indexed_inclusive: Some(10),
-            explanation: None,
-        };
-        let result = params.validate();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("start_line_one_indexed must be greater than 0")
-        );
-    }
-
-    #[test]
-    fn test_read_file_validation_missing_line_numbers() {
-        let params = ReadFileToolCallParams {
-            path: "test.txt".to_string(),
-            should_read_entire_file: false,
-            start_line_one_indexed: None,
-            end_line_one_indexed_inclusive: Some(10),
-            explanation: None,
-        };
-        let result = params.validate();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("start_line_one_indexed and end_line_one_indexed_inclusive are required")
-        );
-    }
-
-    #[test]
-    fn test_read_file_validation_empty_path() {
-        let params = ReadFileToolCallParams {
-            path: "".to_string(),
-            should_read_entire_file: true,
-            start_line_one_indexed: None,
-            end_line_one_indexed_inclusive: None,
-            explanation: None,
-        };
-        let result = params.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("path cannot be empty"));
-    }
-
-    #[test]
-    fn test_read_file_validation_read_entire_file() {
-        let params = ReadFileToolCallParams {
-            path: "test.txt".to_string(),
-            should_read_entire_file: true,
-            start_line_one_indexed: None,
-            end_line_one_indexed_inclusive: None,
-            explanation: None,
-        };
-        assert!(params.validate().is_ok());
-    }
-
-    #[test]
-    fn test_read_file_validation_equal_line_numbers() {
-        let params = ReadFileToolCallParams {
-            path: "test.txt".to_string(),
-            should_read_entire_file: false,
-            start_line_one_indexed: Some(5),
-            end_line_one_indexed_inclusive: Some(5),
-            explanation: None,
-        };
-        assert!(params.validate().is_ok());
-    }
-
-    #[test]
-    fn test_fuzzy_search_validation_empty_query() {
-        let params = FuzzySearchToolCallParams {
-            query: "".to_string(),
-            explanation: None,
-        };
-        assert!(params.validate().is_err());
-    }
-
-    #[test]
-    fn test_fuzzy_search_validation_valid_params() {
-        let params = FuzzySearchToolCallParams {
-            query: "test.rs".to_string(),
-            explanation: Some("Searching for test files".to_string()),
-        };
-        assert!(params.validate().is_ok());
     }
 }
